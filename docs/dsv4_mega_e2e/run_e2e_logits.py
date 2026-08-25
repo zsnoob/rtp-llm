@@ -118,10 +118,31 @@ def compare(a: str = "logits_baseline", b: str = "logits_mega") -> None:
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "baseline":
-        run("logits_baseline", {"DSV4_MEGA_CSA": "0", "DSV4_MEGA_HCA": "0"})
+        run(
+            "logits_baseline",
+            {
+                "DSV4_MEGA_CSA": "0",
+                "DSV4_MEGA_HCA": "0",
+                "DSV4_MEGA_MOE_FRONT": "0",
+            },
+        )
     elif mode == "baseline2":  # run-to-run noise floor probe
-        run("logits_baseline2", {"DSV4_MEGA_CSA": "0", "DSV4_MEGA_HCA": "0"})
+        run(
+            "logits_baseline2",
+            {
+                "DSV4_MEGA_CSA": "0",
+                "DSV4_MEGA_HCA": "0",
+                "DSV4_MEGA_MOE_FRONT": "0",
+            },
+        )
     elif mode == "mega":
-        run("logits_mega", {"DSV4_MEGA_CSA": "1", "DSV4_MEGA_HCA": "1"})
+        run(
+            "logits_mega",
+            {
+                "DSV4_MEGA_CSA": "1",
+                "DSV4_MEGA_HCA": "1",
+                "DSV4_MEGA_MOE_FRONT": "1" if e2e.MOE_FRONT else "0",
+            },
+        )
     elif mode == "compare":
         compare(*sys.argv[2:4])

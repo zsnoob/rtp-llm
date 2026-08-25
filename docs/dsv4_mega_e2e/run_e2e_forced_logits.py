@@ -38,12 +38,37 @@ from typing import Any
 import numpy as np
 
 
+_MOE_FRONT_ENV = {
+    "DSV4_MEGA_MOE_FRONT": "1"
+    if os.environ.get("E2E_MOE_FRONT", "0") not in ("0", "", "false", "False")
+    else "0"
+}
 MODE_ENVS = {
-    "baseline": {"DSV4_MEGA_CSA": "0", "DSV4_MEGA_HCA": "0"},
-    "baseline2": {"DSV4_MEGA_CSA": "0", "DSV4_MEGA_HCA": "0"},
-    "hca": {"DSV4_MEGA_CSA": "0", "DSV4_MEGA_HCA": "1"},
-    "csa": {"DSV4_MEGA_CSA": "1", "DSV4_MEGA_HCA": "0"},
-    "mega": {"DSV4_MEGA_CSA": "1", "DSV4_MEGA_HCA": "1"},
+    "baseline": {
+        "DSV4_MEGA_CSA": "0",
+        "DSV4_MEGA_HCA": "0",
+        "DSV4_MEGA_MOE_FRONT": "0",
+    },
+    "baseline2": {
+        "DSV4_MEGA_CSA": "0",
+        "DSV4_MEGA_HCA": "0",
+        "DSV4_MEGA_MOE_FRONT": "0",
+    },
+    "hca": {
+        "DSV4_MEGA_CSA": "0",
+        "DSV4_MEGA_HCA": "1",
+        "DSV4_MEGA_MOE_FRONT": "0",
+    },
+    "csa": {
+        "DSV4_MEGA_CSA": "1",
+        "DSV4_MEGA_HCA": "0",
+        "DSV4_MEGA_MOE_FRONT": "0",
+    },
+    "mega": {
+        "DSV4_MEGA_CSA": "1",
+        "DSV4_MEGA_HCA": "1",
+        **_MOE_FRONT_ENV,
+    },
 }
 VOCAB_PROBE_SIZE = int(os.environ.get("E2E_LOGITS_PROBE_SIZE", "1024"))
 SEMANTIC_STEPS = int(os.environ.get("E2E_LOGITS_SEMANTIC_STEPS", "8"))
