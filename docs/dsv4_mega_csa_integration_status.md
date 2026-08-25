@@ -64,7 +64,7 @@ DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完
 ### 2026-08-26：CUDA13 wheel release gate
 
 RTP 集成代码与 release metadata 已推送到 `zsnoob/rtp-llm:dsv4-mega`，当前提交为
-`cdb92fcfe`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
+`33596ba52`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
 可复现源码归档（SHA256
 `e07f90609eedab9247983b7426726c20274edc1a7493f2d828122802a6046873`），其 MoE-front
 source fingerprint 为
