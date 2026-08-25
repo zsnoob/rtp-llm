@@ -55,8 +55,9 @@ class MegaMoEFrontRuntime:
         self._injected_ops = ops_module is not None
         self._runtime_checked = False
         self._workspaces: Dict[Tuple[str, int, int], MegaMoEFrontWorkspace] = {}
+        self._workspace_owners: Dict[Tuple[str, int, int], Any] = {}
         self._plans: Dict[int, Dict[tuple, _FrontPlanEntry]] = {}
-        self._validated_buffers: set[int] = set()
+        self._validated_buffers: Dict[int, Any] = {}
 
     @property
     def allows_cpu_for_test(self) -> bool:
@@ -234,7 +235,7 @@ class MegaMoEFrontRuntime:
     def validate_buffer(self, buffer: Any) -> None:
         """Validate the zero-copy DeepGEMM publication ABI once per buffer."""
         key = id(buffer)
-        if key in self._validated_buffers:
+        if self._validated_buffers.get(key) is buffer:
             return
 
         expected = (
@@ -289,13 +290,15 @@ class MegaMoEFrontRuntime:
                 f"dtype={shared.dtype}, shape={tuple(shared.shape)}, "
                 f"stride={tuple(shared.stride())}"
             )
-        self._validated_buffers.add(key)
+        # Retain the owner so a later Python object cannot reuse this id and
+        # accidentally inherit validation for a different symmetric buffer.
+        self._validated_buffers[key] = buffer
 
     def workspace(self, device: torch.device, buffer: Any) -> MegaMoEFrontWorkspace:
         device_index = -1 if device.index is None else int(device.index)
         key = (device.type, device_index, id(buffer))
         workspace = self._workspaces.get(key)
-        if workspace is not None:
+        if workspace is not None and self._workspace_owners.get(key) is buffer:
             return workspace
         if self._capturing(device):
             raise RuntimeError(
@@ -338,6 +341,7 @@ class MegaMoEFrontRuntime:
             ),
         )
         self._workspaces[key] = workspace
+        self._workspace_owners[key] = buffer
         return workspace
 
     def plan(
