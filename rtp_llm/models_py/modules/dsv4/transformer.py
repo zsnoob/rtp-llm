@@ -88,6 +88,7 @@ class V4Args:
     world_size: int = 1
     world_rank: int = 0
     is_decode_role: bool = False
+    is_speculative: bool = False
     # KV-cache dtype switch.  True selects ``AttentionFP8`` (paged 584B
     # SWA/CSA/HCA pools, FlashMLA dual-pool decode); False keeps the BF16
     # ``Attention`` path. Resolved from
@@ -194,6 +195,13 @@ class V4Transformer(nn.Module):
             ]
         )
         self._mega_csa_runtime = None
+        self._mega_moe_front_runtime = None
+        self.register_buffer(
+            "_mega_moe_front_hidden_capacity", None, persistent=False
+        )
+        self.register_buffer(
+            "_mega_moe_front_input_ids_capacity", None, persistent=False
+        )
         mega_flags = {
             name: os.environ.get(name, "0") not in ("0", "", "false", "False")
             for name in ("DSV4_MEGA_CSA", "DSV4_MEGA_HCA")
@@ -212,6 +220,39 @@ class V4Transformer(nn.Module):
                     layer.enable_mega_csa(self._mega_csa_runtime, mw.weights[layer_id])
                 if mega_flags["DSV4_MEGA_HCA"]:
                     layer.enable_mega_hca(self._mega_csa_runtime, mw.weights[layer_id])
+        enable_moe_front = os.environ.get("DSV4_MEGA_MOE_FRONT", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
+        )
+        pro_front_geometry = (
+            int(args.dim) == 7168
+            and int(args.n_routed_experts) == 384
+            and int(args.n_activated_experts) == 6
+            and int(args.hc_mult) == 4
+            and int(args.tp_size) == 1
+        )
+        if enable_moe_front and not args.is_speculative and pro_front_geometry:
+            from rtp_llm.models_py.modules.dsv4.moe.native_front import (
+                MOE_FRONT_MAX_M,
+                MegaMoEFrontRuntime,
+            )
+
+            self._mega_moe_front_runtime = MegaMoEFrontRuntime()
+            device = self.embed.weight.device
+            self._mega_moe_front_hidden_capacity = torch.empty(
+                (MOE_FRONT_MAX_M, 1, args.hc_mult, args.dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self._mega_moe_front_input_ids_capacity = torch.empty(
+                (MOE_FRONT_MAX_M,), dtype=torch.int64, device=device
+            )
+            for layer_id, layer in enumerate(self.layers):
+                layer.enable_mega_moe_front(
+                    self._mega_moe_front_runtime, mw.weights[layer_id]
+                )
         self.norm = RMSNorm(gw[W.final_ln_gamma], args.norm_eps)
 
         # MTP draft is a separate model (``DeepSeekV4MtpModel``) that
@@ -471,6 +512,39 @@ class V4Transformer(nn.Module):
         if self._mega_csa_runtime is not None:
             self._mega_csa_runtime.begin_decode(attn_metadata)
 
+    def prepare_moe_front_decode_inputs(
+        self, embedded: torch.Tensor, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Expand HC into stable capacity-128 storage for the native front."""
+        if (
+            self._mega_moe_front_runtime is None
+            or embedded.dim() != 3
+            or int(embedded.shape[1]) != 1
+            or not 1 <= int(embedded.shape[0]) <= 128
+            or embedded.dtype != torch.bfloat16
+        ):
+            return (
+                embedded.unsqueeze(2).repeat(1, 1, self.hc_mult, 1),
+                input_ids,
+            )
+
+        hidden_capacity = self._mega_moe_front_hidden_capacity
+        input_ids_capacity = self._mega_moe_front_input_ids_capacity
+        if hidden_capacity is None or input_ids_capacity is None:
+            raise RuntimeError("DSV4 native MoE front decode buffers are not prepared")
+        if hidden_capacity.device != embedded.device:
+            raise RuntimeError(
+                "DSV4 native MoE front decode buffer device mismatch: "
+                f"buffer={hidden_capacity.device}, input={embedded.device}"
+            )
+
+        m = int(embedded.shape[0])
+        hidden = hidden_capacity[:m]
+        hidden.copy_(embedded.unsqueeze(2).expand_as(hidden))
+        ids = input_ids_capacity[:m].view(input_ids.shape)
+        ids.copy_(input_ids)
+        return hidden, ids
+
     @torch.inference_mode()
     def forward_decode(
         self,
@@ -489,8 +563,10 @@ class V4Transformer(nn.Module):
             input_ids_2d = input_ids.view(B, q_len)
         else:
             input_ids_2d = input_ids
-        h = self.embed(input_ids_2d)  # [B, q_len, dim]
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, q_len, hc, dim]
+        embedded = self.embed(input_ids_2d)  # [B, q_len, dim]
+        h, input_ids_2d = self.prepare_moe_front_decode_inputs(
+            embedded, input_ids_2d
+        )
         self.begin_decode(attn_metadata)
         for layer in self.layers:
             h = layer.forward_decode(h, attn_metadata, input_ids_2d, kv_cache=kv_cache)

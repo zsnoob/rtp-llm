@@ -307,10 +307,14 @@ def forward_layers(
             _rt_on = False
 
     if prepare_hidden_fn is None:
-        h = v4.embed(input_ids).view(B, q_len, -1)  # [B, q_len, dim]
+        embedded = v4.embed(input_ids).view(B, q_len, -1)  # [B, q_len, dim]
         if _rt_on:
-            _rt.record("decode_embed_out", h)
-        h = h.unsqueeze(2).repeat(1, 1, v4.hc_mult, 1)  # [B, q_len, hc, dim]
+            _rt.record("decode_embed_out", embedded)
+        prepare_moe_front = getattr(v4, "prepare_moe_front_decode_inputs", None)
+        if prepare_moe_front is None:
+            h = embedded.unsqueeze(2).repeat(1, 1, v4.hc_mult, 1)
+        else:
+            h, input_ids = prepare_moe_front(embedded, input_ids)
     else:
         h = prepare_hidden_fn(input_ids=input_ids, meta=attn_metadata)
     if _rt_on:

@@ -291,6 +291,38 @@ class MoE(nn.Module):
             return False
         return tokens > max_tokens
 
+    def can_use_native_front(self) -> bool:
+        return bool(
+            self._routed_includes_shared
+            and self._strategy.can_use_native_front()
+        )
+
+    def native_front_buffer(self):
+        if not self.can_use_native_front():
+            raise RuntimeError(
+                f"MoE strategy {self._strategy.name!r} cannot consume the "
+                "DSV4 native MoE front"
+            )
+        return self._strategy.native_front_buffer()
+
+    def native_front_block_m(self, tokens: int) -> int:
+        if not self.can_use_native_front():
+            raise RuntimeError(
+                f"MoE strategy {self._strategy.name!r} cannot consume the "
+                "DSV4 native MoE front"
+            )
+        return int(self._strategy.native_front_block_m(int(tokens)))
+
+    def forward_prepacked(self, tokens: int, device: torch.device) -> torch.Tensor:
+        """Run only the expert core after native front buffer publication."""
+        if not self.can_use_native_front():
+            raise RuntimeError(
+                f"MoE strategy {self._strategy.name!r} cannot consume the "
+                "DSV4 native MoE front"
+            )
+        with record_function_range("dsv4.moe.native_front_prepacked_core"):
+            return self._strategy.forward_prepacked(int(tokens), device)
+
     def _run_chunk(
         self,
         x: torch.Tensor,

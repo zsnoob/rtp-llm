@@ -395,6 +395,24 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             and _get_mega_se_gate_pack_kernels() is not None
         )
 
+    def can_use_native_front(self) -> bool:
+        return True
+
+    def native_front_buffer(self):
+        return self._mega_buf
+
+    def native_front_block_m(self, tokens: int) -> int:
+        self._validate_capacity(int(tokens))
+        return self._block_m(int(tokens))
+
+    def forward_prepacked(self, tokens: int, device: torch.device) -> torch.Tensor:
+        """Launch MegaMoE-SE after the native front filled the symm buffer."""
+        tokens = int(tokens)
+        self._validate_capacity(tokens)
+        y = self._mega_y[:tokens]
+        self._launch(y, tokens, device)
+        return y
+
     def _validate_capacity(self, tokens: int) -> None:
         buf = self._mega_buf
         if tokens > buf.num_max_tokens_per_rank:

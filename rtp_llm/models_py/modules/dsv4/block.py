@@ -162,6 +162,7 @@ class Block(nn.Module):
         self._prefill_fast_hc_impls_cached = self._resolve_prefill_fast_hc_impls()
         self._mega_csa_adapter = None
         self._mega_hca_adapter = None
+        self._mega_moe_front_adapter = None
 
     def enable_mega_csa(self, runtime, layer_weights: Dict[str, torch.Tensor]) -> None:
         """Attach the TP1 CSA adapter only to compress-ratio-4 layers."""
@@ -182,6 +183,18 @@ class Block(nn.Module):
         )
 
         self._mega_hca_adapter = MegaHCAAdapter(self, layer_weights, runtime)
+
+    def enable_mega_moe_front(
+        self, runtime, layer_weights: Dict[str, torch.Tensor]
+    ) -> None:
+        """Attach the Pro decode four-kernel FFN front."""
+        from rtp_llm.models_py.modules.dsv4.moe.native_front import (
+            MegaMoEFrontAdapter,
+        )
+
+        self._mega_moe_front_adapter = MegaMoEFrontAdapter(
+            self, layer_weights, runtime
+        )
 
     def _sync_after_first_cp_prefill_attention(self) -> None:
         if self._cp_sync_after_attn_done:
@@ -347,7 +360,18 @@ class Block(nn.Module):
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_residual", x)
 
-        # FFN path — MoE has no per-step state, reuse existing forward
+        if (
+            self._mega_moe_front_adapter is not None
+            and self._mega_moe_front_adapter.supports_decode_shape(x, input_ids)
+        ):
+            x = self._mega_moe_front_adapter.forward_ffn_sublayer(
+                self, x, input_ids
+            )
+            if _dbg_layer:
+                _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_residual", x)
+            return x
+
+        # FFN fallback: prefill, MTP, unsupported geometry, or front disabled.
         residual = x
         x_pre, post, comb = self.ffn_hc.pre(
             x,

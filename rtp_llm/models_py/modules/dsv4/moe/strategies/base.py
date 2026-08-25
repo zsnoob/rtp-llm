@@ -142,6 +142,28 @@ class RoutedExpertsStrategy(nn.Module):
             f"{self.__class__.__name__} does not support MegaMoE gate-pack"
         )
 
+    def can_use_native_front(self) -> bool:
+        """Whether a native front may publish directly into this strategy."""
+        return False
+
+    def native_front_buffer(self):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not expose a native-front buffer"
+        )
+
+    def native_front_block_m(self, tokens: int) -> int:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not expose a native-front block_m"
+        )
+
+    def forward_prepacked(
+        self, tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Run the expert core after a native front populated its buffer."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not accept native-front output"
+        )
+
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
         """Whether this strategy is applicable for ``cfg`` in the current

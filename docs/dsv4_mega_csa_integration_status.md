@@ -54,20 +54,25 @@ Block.forward_decode
        -> output projection -> attn_hc.post
 ```
 
-FFN sublayer、FFN mHC、model head mHC 不在 Mega 替换范围内。
+当前 attention adapter 仍只替换 attention sublayer。本分支同时增加了可独立启用的
+四-kernel native MoE front：在 DSV4-Pro decode、TP1、MegaMoE-SE 且底层 storage 满足
+capacity-128 时，整体替换
+`ffn_hc.pre -> ffn_norm -> router F.linear -> Triton gate-pack`，并直接发布到官方
+DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完成的发布验证见下文
+“B300 四-kernel MoE front 生产接入”。model head mHC 仍不在 Mega 替换范围内。
 
 ## 2. 支持边界
 
 | 项目 | 当前支持 | 处理方式 |
 | --- | --- | --- |
 | 硬件 | Blackwell `sm_100a/sm_103a` | 首次执行前强校验 |
-| 并行 | TP1、单卡 | `tp_size != 1` 初始化失败 |
+| 并行 | attention adapter：TP1、单进程；MoE front：TP1 + EP 多 rank（MegaMoE-SE） | attention 与 MoE 分别独立选路 |
 | KV cache | FP8 | 非 FP8 初始化失败 |
 | 层类型 | `compress_ratio == 4` 的 CSA 层（`DSV4_MEGA_CSA`）；`compress_ratio == 128` 的 HCA 层（`DSV4_MEGA_HCA`） | 按 ratio 分别挂 adapter |
 | 模型几何 | DSV4-Pro（dim 7168）与 DSV4-Flash（dim 4096） | `GEOMETRY_BY_DIM` 按 `attn.dim` 选 profile，其他 dim 初始化失败 |
-| 请求形态 | decode、`q_len == 1`、batch 1..128 | 其余形态走现有路径 |
+| 请求形态 | decode、`q_len == 1`、batch 1..128；MoE front 还要求 capacity-128 storage | 其余形态走现有路径 |
 | 进程角色 | `DECODE` 和单卡 `PDFUSION` | 由 `forward_decode` 限制实际执行 |
-| 开关 | `DSV4_MEGA_CSA=1` / `DSV4_MEGA_HCA=1` | 各自默认关闭，模型构造期固定，共享一个模型级 runtime |
+| 开关 | `DSV4_MEGA_CSA=1` / `DSV4_MEGA_HCA=1` / `DSV4_MEGA_MOE_FRONT=1` | 各自默认关闭，模型构造期固定；MoE 使用独立 runtime |
 
 下列场景保持现有实现：prefill、SWA-only、target verify (`q_len > 1`)、MTP、TP2/DP2。
 MTP 是独立模型且当前 `compress_ratio == 0`，不会挂载 CSA adapter。
@@ -443,6 +448,95 @@ MoE 耗时按 batch 归一化，取 4 个 context、baseline/Mega 以及 CSA/HCA
 | 128 | 64K | 253.6 / 186.0 | 1.363x | 147.8 / 107.2 | 1.379x | 177.4 |
 | 128 | 128K | 313.7 / 230.4 | 1.361x | 160.9 / 114.9 | 1.400x | 177.4 |
 
+### 2026-08-25：B300 四-kernel MoE front 生产接入
+
+`Flash_DeepSeek_V4_Pro` 的 Mega-MoE provider 已把 decode FFN front 收敛为以下四个
+有序 kernel，支持 logical `1 <= M <= 128`，workspace 保持 capacity 128：
+
+```text
+1. sm100_tf32_hc_prenorm_gemm_impl<24,28672,64,32,64,35,128,12,128,128>
+2. mhc_pre_epilogue_kernel<MoeFrontCollapseNormPolicy>
+3. moe_front_router_gemm_kernel<MoeFrontRouterExactPolicy|MoeFrontRouterDynamicPolicy>
+4. moe_front_route_topk_kernel<MoeFrontRouteExactPolicy|MoeFrontRouteDynamicPolicy>
+```
+
+其中第一个 kernel 使用 pinned official DeepGEMM mHC 实现；第二个 kernel 完成 split-K
+reduce、input RMSNorm、collapse、learned FFN RMSNorm，并从 BF16 publication 之前的 FP32
+collapse accumulator 计算 FP32 SSQ。第三个 kernel 使用 BF16 Router 输入/权重和 FP32
+accumulation，同时写 E4M3 activation、packed UE8M0 scale、post/comb；第四个 kernel 完成
+learned V4 TopK-6。HashMoE 保持独立 checkpoint-table route publication。
+
+待发布的 CUDA13 `rtp-kernel.dsv4_mega` ABI 通过 graph-stable
+`Dsv4MoeFrontPlan(hidden_states, hc_fn, logical_m)` 暴露生产 ABI，learned/Hash 分别调用
+`run_learned_out`/`run_hash_out`。Plan 绑定输入与权重指针，所有输出 workspace 由 caller
+持有；front 按官方 MegaMoE buffer ABI 发布，随后继续调用现有
+`deep_gemm.fp8_fp4_mega_moe`，最后进入 mHC post。provider 还必须通过
+`geometry_moe_front()` 报告 `kernel_contract_version=1`；缺少该握手的旧 wheel 会被拒绝，
+避免同一 Python 签名静默落到旧 `hc_gemm_splitk_kernel`。
+
+SM103（148 SM、CUDA 13.0、PyTorch 2.11.0+cu130、DeepGEMM
+`559d79fb6994a58b8a15b4b93bf13ccc16edf247`）单独 front 结果如下。口径为一次 warmed
+CUDA Graph replay，从第一个 production CUDA kernel start 到第四个 kernel end 的 Kineto
+envelope；cold-L2 在同 stream 先写 8 GiB，flush 本身不计时。每点 30 次 warm、7 次 cold：
+
+| M | warm graph envelope | cold-L2 graph envelope |
+| ---: | ---: | ---: |
+| 16 | `18.848 us` | `22.367 us` |
+| 32 | `19.022 us` | `22.750 us` |
+| 64 | `19.198 us` | `23.328 us` |
+| 96 | `19.247 us` | `24.063 us` |
+| 128 | `19.840 us` | `24.447 us` |
+
+所有 M 的 TopK index 精确一致，浮点差约 `2e-14`；30 个 warm sample 的 production
+kernel count 全部为 4，M128 Perfetto 也恰好显示上述四个 semantic kernel。结果来自 RTP
+`MegaMoEFrontAdapter.forward_ffn_sublayer` 对 provider `moe_front_enqueue` 合约的真实调用，
+不是绕过 adapter 的 provider-only 测量。最终 adapter SHA256 为
+`4a4943f754278ea8ed09ff6115880e77b6ae5ecdebad3fed94a2597dc0613486`，结果 JSON SHA256
+为 `ee0a9fc9803e06f8c29ccf2e2de4da62047701f75ce427888066bb4929a47199`，M128 Perfetto
+SHA256 为 `18957fc602c99ca04690192847b269fe4c95304606bc8f0b0bad4dfb092a5c19`。该表只覆盖
+MoE front，不能当作 expert core、EP communication、mHC post 或完整 DecoderLayer 延迟。
+
+RTP 生产接入由以下部分组成：
+
+1. `moe/native_front.py` 负责完整 Plan ABI/geometry 校验、模型级 capacity-128 workspace、
+   pointer-bound Plan cache，以及 learned/Hash 的显式调用；`collapse_ssq` 固定为 FP32；
+2. `Block.forward_decode` 在支持条件满足时把 attention residual 直接交给 native front，跳过
+   原 `ffn_hc.pre + ffn_norm + Router F.linear + gate-pack`；
+3. front 零拷贝写现有 MegaMoE-SE symmetric buffer 的
+   `x/x_sf/shared_l1_acts_sf/topk_idx/topk_weights`，expert core 通过
+   `forward_prepacked` 直接消费，不增加 publication copy kernel；symmetric buffer 可拥有多于
+   128 行，但 Plan ABI 要求精确 `[128,...]`，因此 adapter 为四个 row-major publication
+   tensor 创建同 data pointer 的精确 capacity view，不产生 copy 或第五个 kernel；
+4. RTP 的 logical residual 是 `[M,1,4,7168]`，provider Plan 要求固定
+   `[128,4,7168]`。decode 入口把原 HC `repeat` publication 改为写模型级 capacity-128
+   buffer，并一次 staging capacity-128 `input_ids`；此后 HC post 原地复用该 residual
+   storage。adapter 创建同指针 `as_strided` capacity view；外部调用若没有该容量则回退旧
+   路径，禁止在四-kernel front 内补 copy；
+5. HashMoE layers 使用 INT32 `tid2eid` 和 capacity-128 INT64 `input_ids`；learned layers 使用
+   FP32 correction bias。prefill、MTP、`M > 128`、非 Pro geometry、非 MegaMoE-SE、短 storage
+   均保留原实现；
+6. 模型初始化开关为 `DSV4_MEGA_MOE_FRONT=1`。当前只允许
+   `D=7168/E=384/TopK=6/hc=4/TP=1`，运行时再校验设备 capability 为 `(10,0)` 或
+   `(10,3)`。本次 4 卡机器由 CUDA runtime 实测四张卡均为 `(10,3)`；不依据
+   `nvidia-smi` 的产品名判断架构。
+
+对应单元测试为：
+
+```bash
+bazel test --config=cuda13 \
+  //rtp_llm/models_py/modules/dsv4/test:test_mega_moe_native_front
+```
+
+该测试覆盖 ABI/geometry 拒绝、FP32 SSQ、短 storage 回退、capacity view 同指针、Plan
+复用、learned/Hash 输出 buffer 绑定，以及 `Block.forward_decode` 不再调用旧 FFN front。
+2026-08-25 在上述 4 卡机器的 `cuda:0` 上，使用匹配 provider contract 和本节
+`native_front.py` 完成真实 adapter benchmark：CUDA runtime capability 为 `(10,3)`，覆盖
+logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 Perfetto。
+仓库 Bazel target 已进入依赖解析，但该机器访问 `bazel_skylib-1.0.2.tar.gz` 的内部 OSS
+镜像超时，因此不把本轮记为 Bazel test pass。
+正式发布仍需把匹配 ABI/contract 的 wheel 固定到构建依赖，并完成真实 EP4 CUDA Graph
+和完整 MoE block 数值回归；单 rank adapter 四-kernel Perfetto 已完成。
+
 ## 6. 端到端剩余缺口
 
 按阻塞顺序还需要：
@@ -454,7 +548,23 @@ MoE 耗时按 batch 归一化，取 4 个 context、baseline/Mega 以及 CSA/HCA
    （target verify / MTP 场景仍未覆盖）；
 4. 整模型正确性收口：为 Mega 配置生成 per-配置 golden（框架 smoke 惯例），并在健康模型
    上完成 logits 级对照（Flash 对照排队中）；建议同时把 4 层 Pro 裁层 checkpoint 上传 NAS
-   并新增 `v4_pro_4layer_tp1` / `..._mega` smoke case。
+   并新增 `v4_pro_4layer_tp1` / `..._mega` smoke case；
+5. 测量开关关闭时普通 FP8 整模型路径，确认新增 Python 分支不可测；
+6. 对 normal FP8 与 Mega FP8 做真实模型、代表性长上下文和完整 batch grid 性能 A/B。
+7. 发布包含 `Dsv4MoeFrontPlan` 与 `kernel_contract_version=1` 的 CUDA13 wheel，并完成
+   HashMoE 与 EP4 多 rank 的完整 MoE block 验证；learned routing 的单 rank CUDA Graph、
+   四-kernel Perfetto timeline 已完成。
+
+性能报告至少应单列：
+
+- 框架 int64 slot 直传，并确认 timeline 中没有隐式 conversion/copy；
+- mHC pre 到 front、WQ-B 到 MQA 的 PDL 收益；
+- MQA schedule 生成；
+- TopK + 原生 FlashMLA；
+- 完整 attention sublayer；
+- 开关关闭的普通 FP8 路径；
+- eager 与 CUDA Graph；
+- batch 1/8/16/32/64/128 和代表性 context length。
 
 ## 7. 内源合入方案
 

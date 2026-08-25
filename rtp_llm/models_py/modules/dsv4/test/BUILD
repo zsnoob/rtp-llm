@@ -229,6 +229,15 @@ py_test(
 )
 
 py_test(
+    name = "test_mega_moe_native_front",
+    srcs = ["test_mega_moe_native_front.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
     name = "test_dsv4_kernel_jit_warmup",
     srcs = ["test_dsv4_kernel_jit_warmup.py"],
     deps = [
