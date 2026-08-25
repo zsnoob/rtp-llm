@@ -70,10 +70,14 @@ class MegaMoEFrontRuntime:
             assert self._ops is not None
             return self._ops
         if not self._injected_ops:
+            # The current four-kernel production ABI uses SM103-only
+            # instructions and launch geometry. Keep this check identical to
+            # the native plan constructor instead of accepting SM100 and
+            # failing later inside the extension.
             capability = torch.cuda.get_device_capability(device)
-            if capability not in ((10, 0), (10, 3)):
+            if capability != (10, 3):
                 raise RuntimeError(
-                    "DSV4 native MoE front requires sm_100a or sm_103a, "
+                    "DSV4 native MoE front requires sm_103a, "
                     f"got sm_{capability[0]}{capability[1]}"
                 )
             from rtp_kernel import dsv4_mega

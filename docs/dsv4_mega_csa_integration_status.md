@@ -65,7 +65,7 @@ DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完
 
 | 项目 | 当前支持 | 处理方式 |
 | --- | --- | --- |
-| 硬件 | Blackwell `sm_100a/sm_103a` | 首次执行前强校验 |
+| 硬件 | CSA/HCA：Blackwell `sm_100a/sm_103a`；MoE front：`sm_103a` | 首次执行前强校验 |
 | 并行 | attention adapter：TP1、单进程；MoE front：TP1 + EP 多 rank（MegaMoE-SE） | attention 与 MoE 分别独立选路 |
 | KV cache | FP8 | 非 FP8 初始化失败 |
 | 层类型 | `compress_ratio == 4` 的 CSA 层（`DSV4_MEGA_CSA`）；`compress_ratio == 128` 的 HCA 层（`DSV4_MEGA_HCA`） | 按 ratio 分别挂 adapter |
@@ -516,9 +516,9 @@ RTP 生产接入由以下部分组成：
    FP32 correction bias。prefill、MTP、`M > 128`、非 Pro geometry、非 MegaMoE-SE、短 storage
    均保留原实现；
 6. 模型初始化开关为 `DSV4_MEGA_MOE_FRONT=1`。当前只允许
-   `D=7168/E=384/TopK=6/hc=4/TP=1`，运行时再校验设备 capability 为 `(10,0)` 或
-   `(10,3)`。本次 4 卡机器由 CUDA runtime 实测四张卡均为 `(10,3)`；不依据
-   `nvidia-smi` 的产品名判断架构。
+   `D=7168/E=384/TopK=6/hc=4/TP=1/EP>1`，运行时再通过
+   `torch.cuda.get_device_capability()` 校验设备 capability 必须为 `(10,3)`。当前
+   four-kernel C++ plan 只实现 SM103；SM100 仍仅适用于 CSA/HCA attention adapter。
 
 对应单元测试为：
 
@@ -530,7 +530,8 @@ bazel test --config=cuda13 \
 该测试覆盖 ABI/geometry 拒绝、FP32 SSQ、短 storage 回退、capacity view 同指针、Plan
 复用、learned/Hash 输出 buffer 绑定，以及 `Block.forward_decode` 不再调用旧 FFN front。
 2026-08-25 在上述 4 卡机器的 `cuda:0` 上，使用匹配 provider contract 和本节
-`native_front.py` 完成真实 adapter benchmark：CUDA runtime capability 为 `(10,3)`，覆盖
+`native_front.py` 完成真实 adapter benchmark：通过 PyTorch CUDA runtime 得到的 capability 为
+`(10,3)`，覆盖
 logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 Perfetto。
 仓库 Bazel target 已进入依赖解析，但该机器访问 `bazel_skylib-1.0.2.tar.gz` 的内部 OSS
 镜像超时，因此不把本轮记为 Bazel test pass。

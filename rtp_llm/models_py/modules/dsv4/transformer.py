@@ -232,7 +232,14 @@ class V4Transformer(nn.Module):
             and int(args.n_activated_experts) == 6
             and int(args.hc_mult) == 4
             and int(args.tp_size) == 1
+            and int(args.ep_size) > 1
         )
+        if enable_moe_front and not args.is_speculative and not pro_front_geometry:
+            raise RuntimeError(
+                "DSV4_MEGA_MOE_FRONT requires the production MegaMoE-SE "
+                "geometry: dim=7168, routed_experts=384, topk=6, hc_mult=4, "
+                "TP=1, EP>1"
+            )
         if enable_moe_front and not args.is_speculative and pro_front_geometry:
             from rtp_llm.models_py.modules.dsv4.moe.native_front import (
                 MOE_FRONT_MAX_M,
