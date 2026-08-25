@@ -173,7 +173,7 @@ class _FakeOps:
     def build_info_moe_front(self):
         return {
             "source_commit": "c81d23db",
-            "source_sha256": "0" * 64,
+            "source_sha256": "1" * 64,
             "target_arches": "sm_100a,sm_103a",
             "production_arch": "sm_103a",
             "kernel_count": 4,
@@ -286,6 +286,19 @@ class MegaMoEFrontRuntimeTest(unittest.TestCase):
         ops.build_info_moe_front = lambda: {
             "source_commit": "unknown",
             "source_sha256": "unknown",
+            "target_arches": "sm_100a,sm_103a",
+            "production_arch": "sm_103a",
+            "kernel_count": 4,
+        }
+        runtime = MegaMoEFrontRuntime(ops_module=ops)
+        with self.assertRaisesRegex(RuntimeError, "build info mismatch"):
+            runtime.require_ops(torch.device("cpu"))
+
+    def test_rejects_zero_build_identity(self) -> None:
+        ops = _FakeOps()
+        ops.build_info_moe_front = lambda: {
+            "source_commit": "0" * 8,
+            "source_sha256": "0" * 64,
             "target_arches": "sm_100a,sm_103a",
             "production_arch": "sm_103a",
             "kernel_count": 4,

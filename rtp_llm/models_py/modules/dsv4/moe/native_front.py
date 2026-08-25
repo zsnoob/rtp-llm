@@ -194,6 +194,10 @@ class MegaMoEFrontRuntime:
                 f"got {mismatched}, expected {expected}"
             )
         build_info = self._ops.build_info_moe_front()
+        if not isinstance(build_info, dict):
+            raise RuntimeError(
+                "rtp-kernel DSV4 MoE front build info must be a dictionary"
+            )
         expected_build = {
             "target_arches": "sm_100a,sm_103a",
             "production_arch": "sm_103a",
@@ -205,13 +209,17 @@ class MegaMoEFrontRuntime:
             if build_info.get(key) != value
         }
         source_commit = str(build_info.get("source_commit", "unknown"))
-        if source_commit == "unknown" or not re.fullmatch(
-            r"[0-9a-f]{8,40}", source_commit
+        if (
+            source_commit == "unknown"
+            or not re.fullmatch(r"[0-9a-f]{8,40}", source_commit)
+            or set(source_commit) == {"0"}
         ):
             mismatched_build["source_commit"] = source_commit
         source_sha256 = str(build_info.get("source_sha256", "unknown"))
-        if source_sha256 == "unknown" or not re.fullmatch(
-            r"[0-9a-f]{64}", source_sha256
+        if (
+            source_sha256 == "unknown"
+            or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+            or set(source_sha256) == {"0"}
         ):
             mismatched_build["source_sha256"] = source_sha256
         if mismatched_build:
