@@ -170,6 +170,15 @@ class _FakeOps:
     def geometry_moe_front(self):
         return self.geometry
 
+    def build_info_moe_front(self):
+        return {
+            "source_commit": "c81d23db",
+            "source_sha256": "0" * 64,
+            "target_arches": "sm_100a,sm_103a",
+            "production_arch": "sm_103a",
+            "kernel_count": 4,
+        }
+
 
 def _buffer(rows=MOE_FRONT_MAX_M):
     shared_rows = max(rows, MOE_FRONT_MAX_M)
@@ -270,6 +279,19 @@ class MegaMoEFrontRuntimeTest(unittest.TestCase):
             ops_module=_FakeOps(_geometry(collapse_ssq_bits=16))
         )
         with self.assertRaisesRegex(RuntimeError, "geometry mismatch"):
+            runtime.require_ops(torch.device("cpu"))
+
+    def test_rejects_stale_build_info(self) -> None:
+        ops = _FakeOps()
+        ops.build_info_moe_front = lambda: {
+            "source_commit": "unknown",
+            "source_sha256": "unknown",
+            "target_arches": "sm_100a,sm_103a",
+            "production_arch": "sm_103a",
+            "kernel_count": 4,
+        }
+        runtime = MegaMoEFrontRuntime(ops_module=ops)
+        with self.assertRaisesRegex(RuntimeError, "build info mismatch"):
             runtime.require_ops(torch.device("cpu"))
 
     def test_rejects_short_zero_copy_buffer(self) -> None:

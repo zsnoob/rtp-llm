@@ -9,6 +9,7 @@ MegaMoE-SE's existing symmetric buffer.
 from __future__ import annotations
 
 import inspect
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
@@ -84,7 +85,11 @@ class MegaMoEFrontRuntime:
 
             self._ops = dsv4_mega
         assert self._ops is not None
-        required = ("Dsv4MoeFrontPlan", "geometry_moe_front")
+        required = (
+            "Dsv4MoeFrontPlan",
+            "geometry_moe_front",
+            "build_info_moe_front",
+        )
         missing = [
             name
             for name in required
@@ -187,6 +192,33 @@ class MegaMoEFrontRuntime:
             raise RuntimeError(
                 "rtp-kernel DSV4 MoE front geometry mismatch: "
                 f"got {mismatched}, expected {expected}"
+            )
+        build_info = self._ops.build_info_moe_front()
+        expected_build = {
+            "target_arches": "sm_100a,sm_103a",
+            "production_arch": "sm_103a",
+            "kernel_count": 4,
+        }
+        mismatched_build = {
+            key: build_info.get(key)
+            for key, value in expected_build.items()
+            if build_info.get(key) != value
+        }
+        source_commit = str(build_info.get("source_commit", "unknown"))
+        if source_commit == "unknown" or not re.fullmatch(
+            r"[0-9a-f]{8,40}", source_commit
+        ):
+            mismatched_build["source_commit"] = source_commit
+        source_sha256 = str(build_info.get("source_sha256", "unknown"))
+        if source_sha256 == "unknown" or not re.fullmatch(
+            r"[0-9a-f]{64}", source_sha256
+        ):
+            mismatched_build["source_sha256"] = source_sha256
+        if mismatched_build:
+            raise RuntimeError(
+                "rtp-kernel DSV4 MoE front build info mismatch: "
+                f"got {mismatched_build}, expected {expected_build} "
+                "with a non-unknown source commit and SHA256"
             )
         self._runtime_checked = True
         return self._ops
