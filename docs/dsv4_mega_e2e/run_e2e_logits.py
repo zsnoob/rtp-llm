@@ -124,6 +124,10 @@ if __name__ == "__main__":
                 "DSV4_MEGA_CSA": "0",
                 "DSV4_MEGA_HCA": "0",
                 "DSV4_MEGA_MOE_FRONT": "0",
+                "DSV4_USE_MEGA_MOE_SE": "0",
+                "DSV4_USE_MEGA_MOE": "1",
+                "DSV4_USE_MEGA_MOE_FUSED": "0",
+                "DSV4_MOE_STRATEGY": "",
             },
         )
     elif mode == "baseline2":  # run-to-run noise floor probe
@@ -133,6 +137,10 @@ if __name__ == "__main__":
                 "DSV4_MEGA_CSA": "0",
                 "DSV4_MEGA_HCA": "0",
                 "DSV4_MEGA_MOE_FRONT": "0",
+                "DSV4_USE_MEGA_MOE_SE": "0",
+                "DSV4_USE_MEGA_MOE": "1",
+                "DSV4_USE_MEGA_MOE_FUSED": "0",
+                "DSV4_MOE_STRATEGY": "",
             },
         )
     elif mode == "mega":
@@ -142,6 +150,10 @@ if __name__ == "__main__":
                 "DSV4_MEGA_CSA": "1",
                 "DSV4_MEGA_HCA": "1",
                 "DSV4_MEGA_MOE_FRONT": "1" if e2e.MOE_FRONT else "0",
+                "DSV4_USE_MEGA_MOE_SE": "1" if e2e.MOE_FRONT else "0",
+                "DSV4_USE_MEGA_MOE": "1",
+                "DSV4_USE_MEGA_MOE_FUSED": "0",
+                "DSV4_MOE_STRATEGY": "",
             },
         )
     elif mode == "compare":

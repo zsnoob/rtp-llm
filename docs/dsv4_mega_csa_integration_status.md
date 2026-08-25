@@ -558,7 +558,8 @@ RTP 生产接入由以下部分组成：
 5. HashMoE layers 使用 INT32 `tid2eid` 和 capacity-128 INT64 `input_ids`；learned layers 使用
    FP32 correction bias。prefill、MTP、`M > 128`、非 Pro geometry、非 MegaMoE-SE、短 storage
    均保留原实现；
-6. 模型初始化开关为 `DSV4_MEGA_MOE_FRONT=1`。当前只允许
+6. 模型初始化开关为 `DSV4_MEGA_MOE_FRONT=1`，并必须同时设置
+   `DSV4_USE_MEGA_MOE_SE=1` 选择带 shared expert 的 Mega strategy。当前只允许
    `D=7168/E=384/TopK=6/hc=4/TP=1/EP>1`，运行时再通过
    `torch.cuda.get_device_capability()` 校验设备 capability 必须为 `(10,3)`。当前
    four-kernel C++ plan 只实现 SM103；SM100 仍仅适用于 CSA/HCA attention adapter。
@@ -737,7 +738,8 @@ cache 环境变量（`FLASHINFER_WORKSPACE_BASE`、`DG_JIT_CACHE_DIR`、`TRTLLM_
 `TILELANG_CACHE_DIR`、`TORCH_EXTENSIONS_DIR`、`TVM_FFI_CACHE_DIR`、`CUTE_DSL_CACHE_DIR`、
 `TRITON_CACHE_DIR`）到自有目录（compare 脚本已代管）；`DG_JIT_CPP_STANDARD=20`。
 Mega 开关：`DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`、
-`DSV4_MEGA_MOE_FRONT=1`（默认全关，即 baseline）。MoE front 还要求
+`DSV4_MEGA_MOE_FRONT=1`、`DSV4_USE_MEGA_MOE_SE=1`（默认全关，即 baseline）。
+MoE front 还要求
 `D=7168/E=384/TopK=6/hc=4/TP=1/EP>1` 和 PyTorch capability `(10,3)`。
 
 ### 8.4 测试

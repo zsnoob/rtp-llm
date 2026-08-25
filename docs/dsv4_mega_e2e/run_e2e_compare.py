@@ -231,6 +231,10 @@ def main() -> None:
                 "DSV4_MEGA_CSA": "0",
                 "DSV4_MEGA_HCA": "0",
                 "DSV4_MEGA_MOE_FRONT": "0",
+                "DSV4_USE_MEGA_MOE_SE": "0",
+                "DSV4_USE_MEGA_MOE": "1",
+                "DSV4_USE_MEGA_MOE_FUSED": "0",
+                "DSV4_MOE_STRATEGY": "",
             },
         )
     if only in (None, "mega"):
@@ -240,6 +244,10 @@ def main() -> None:
                 "DSV4_MEGA_CSA": "1",
                 "DSV4_MEGA_HCA": "1",
                 "DSV4_MEGA_MOE_FRONT": "1" if MOE_FRONT else "0",
+                "DSV4_USE_MEGA_MOE_SE": "1" if MOE_FRONT else "0",
+                "DSV4_USE_MEGA_MOE": "1",
+                "DSV4_USE_MEGA_MOE_FUSED": "0",
+                "DSV4_MOE_STRATEGY": "",
             },
         )
     if len(runs) < 2:

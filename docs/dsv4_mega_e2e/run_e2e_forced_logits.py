@@ -43,26 +43,52 @@ _MOE_FRONT_ENV = {
     if os.environ.get("E2E_MOE_FRONT", "0") not in ("0", "", "false", "False")
     else "0"
 }
+_MOE_FRONT_ENV["DSV4_USE_MEGA_MOE_SE"] = (
+    "1" if _MOE_FRONT_ENV["DSV4_MEGA_MOE_FRONT"] == "1" else "0"
+)
+_MOE_FRONT_ENV.update(
+    {
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_USE_MEGA_MOE_FUSED": "0",
+        "DSV4_MOE_STRATEGY": "",
+    }
+)
 MODE_ENVS = {
     "baseline": {
         "DSV4_MEGA_CSA": "0",
         "DSV4_MEGA_HCA": "0",
         "DSV4_MEGA_MOE_FRONT": "0",
+        "DSV4_USE_MEGA_MOE_SE": "0",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_USE_MEGA_MOE_FUSED": "0",
+        "DSV4_MOE_STRATEGY": "",
     },
     "baseline2": {
         "DSV4_MEGA_CSA": "0",
         "DSV4_MEGA_HCA": "0",
         "DSV4_MEGA_MOE_FRONT": "0",
+        "DSV4_USE_MEGA_MOE_SE": "0",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_USE_MEGA_MOE_FUSED": "0",
+        "DSV4_MOE_STRATEGY": "",
     },
     "hca": {
         "DSV4_MEGA_CSA": "0",
         "DSV4_MEGA_HCA": "1",
         "DSV4_MEGA_MOE_FRONT": "0",
+        "DSV4_USE_MEGA_MOE_SE": "0",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_USE_MEGA_MOE_FUSED": "0",
+        "DSV4_MOE_STRATEGY": "",
     },
     "csa": {
         "DSV4_MEGA_CSA": "1",
         "DSV4_MEGA_HCA": "0",
         "DSV4_MEGA_MOE_FRONT": "0",
+        "DSV4_USE_MEGA_MOE_SE": "0",
+        "DSV4_USE_MEGA_MOE": "1",
+        "DSV4_USE_MEGA_MOE_FUSED": "0",
+        "DSV4_MOE_STRATEGY": "",
     },
     "mega": {
         "DSV4_MEGA_CSA": "1",
