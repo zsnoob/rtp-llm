@@ -619,7 +619,10 @@ CUDA Extension：准备 python3.10 venv 并安装 torch cu130 与
 
 ```bash
 cd <work>/cuda_extension
-python build.py          # pip wheel 全量构建，约 13 分钟，产物在 dist/
+RTP_KERNEL_COMMIT_ID=$(git rev-parse HEAD) \
+RTP_KERNEL_BUILD_TIMESTAMP=$(date -u +%Y%m%d%H%M%S) \
+WHEEL_CUDA_VERSION=cu130 DSV4_MEGA_ONLY=1 \
+python build.py          # 只构建可追溯的 dsv4_mega extension，产物在 dist/
 pip install --force-reinstall --no-deps dist/rtp_kernel-*.whl
 ```
 
@@ -670,7 +673,9 @@ DSV4_PRO_SRC=<全量 Pro 目录> python truncate_dsv4_pro.py --layers 4 --out <�
 cache 环境变量（`FLASHINFER_WORKSPACE_BASE`、`DG_JIT_CACHE_DIR`、`TRTLLM_DG_CACHE_DIR`、
 `TILELANG_CACHE_DIR`、`TORCH_EXTENSIONS_DIR`、`TVM_FFI_CACHE_DIR`、`CUTE_DSL_CACHE_DIR`、
 `TRITON_CACHE_DIR`）到自有目录（compare 脚本已代管）；`DG_JIT_CPP_STANDARD=20`。
-Mega 开关：`DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`（默认全关，即 baseline）。
+Mega 开关：`DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`、
+`DSV4_MEGA_MOE_FRONT=1`（默认全关，即 baseline）。MoE front 还要求
+`D=7168/E=384/TopK=6/hc=4/TP=1/EP>1` 和 PyTorch capability `(10,3)`。
 
 ### 8.4 测试
 
