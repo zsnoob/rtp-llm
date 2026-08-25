@@ -61,6 +61,23 @@ capacity-128 时，整体替换
 DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完成的发布验证见下文
 “B300 四-kernel MoE front 生产接入”。model head mHC 仍不在 Mega 替换范围内。
 
+### 2026-08-26：CUDA13 wheel release gate
+
+RTP 集成代码与 release metadata 已推送到 `zsnoob/rtp-llm:dsv4-mega`，当前提交为
+`cdb92fcfe`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
+可复现源码归档（SHA256
+`e07f90609eedab9247983b7426726c20274edc1a7493f2d828122802a6046873`），其 MoE-front
+source fingerprint 为
+`5d9d222c7cd32c0969b2ed6cca25ffd837c07eddc07e3d204221179e32221ee0`。构建脚本只用
+`torch.cuda.get_device_capability()` 检查四张设备均为 `(10,3)`，并在安装后验证完整
+`rtp_ops`、`rtp_ops_dsv4_mega`、四-kernel contract 和 build identity。
+
+本机已完成源码 fingerprint、脚本语法、Python compileall、文档 diff 和历史四-kernel
+artifact 校验；真实 CUDA13/SM103 wheel 构建、EP4 MoE block 正确性以及 CSA+HCA+MoE
+front 完整生成仍是 release gate，必须在可访问的四卡 WebIDE 上执行。当前 Mac 缺少
+CUDA toolchain，现有远端地址的 SSH/WebIDE 会话也不可达，因此本节不把历史组件级或
+算子级结果记为当前 wheel 的端到端通过。
+
 ## 2. 支持边界
 
 | 项目 | 当前支持 | 处理方式 |
