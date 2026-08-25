@@ -542,7 +542,8 @@ logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 P
 
 按阻塞顺序还需要：
 
-1. 发布 `2d6261a` 对应的 CUDA13 x86_64 wheel，更新开源/内源实际使用的依赖入口和 lock；
+1. 发布当前 `dsv4_megakernel` HEAD（本地已提交为 `dc880c9`）对应的 CUDA13 x86_64
+   wheel，更新开源/内源实际使用的依赖入口和 lock；
 2. 增加由真实 `KVCacheManager` 创建 typed pools/block tables 的集成测试，替代手工 pool
    fixture（本地 serving e2e 已实际走真实 allocator，但缺 bazel 内可回归的形式）；
 3. ~~校验 normal prefill -> Mega decode~~ 已在裁层 Pro 与全量 Flash serving 中覆盖
