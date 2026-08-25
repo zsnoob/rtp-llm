@@ -621,10 +621,15 @@ CUDA Extension：准备 python3.10 venv 并安装 torch cu130 与
 cd <work>/cuda_extension
 RTP_KERNEL_COMMIT_ID=$(git rev-parse HEAD) \
 RTP_KERNEL_BUILD_TIMESTAMP=$(date -u +%Y%m%d%H%M%S) \
-WHEEL_CUDA_VERSION=cu130 DSV4_MEGA_ONLY=1 \
-python build.py          # 只构建可追溯的 dsv4_mega extension，产物在 dist/
+WHEEL_CUDA_VERSION=cu130 \
+python build.py          # 构建普通 rtp_ops + rtp_ops_dsv4_mega，产物在 dist/
 pip install --force-reinstall --no-deps dist/rtp_kernel-*.whl
 ```
+
+生产 RTP serving 不要设置 `DSV4_MEGA_ONLY=1`：该过滤只保留
+`rtp_ops_dsv4_mega`，会遗漏现有 expert core/kvcache 所需的 `rtp_ops`，导致
+`import rtp_kernel` 失败。四-kernel ABI 仍由同一全量 wheel 中的
+`rtp_ops_dsv4_mega` 提供。
 
 冒烟：`python -c "from rtp_kernel import dsv4_mega; print(dsv4_mega.geometry_csa())"`
 应同时出现 Pro 与 `*_flash` 两组形状。
