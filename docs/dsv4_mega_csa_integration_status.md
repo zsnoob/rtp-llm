@@ -672,6 +672,19 @@ E2E_CKPT=... ./watch_and_run_logits.sh                        # 轮询空卡自�
 DSV4_PRO_SRC=<全量 Pro 目录> python truncate_dsv4_pro.py --layers 4 --out <目录>
 ```
 
+上述默认脚本是单卡 CSA/HCA 对照，`EP=1` 时不会执行 MoE front。Pro/EP4
+端到端必须明确使用四张卡和 native front 开关：
+
+```bash
+E2E_CKPT=<DeepSeek-V4-Pro 目录> \
+E2E_GPU=0,1,2,3 E2E_EP_SIZE=4 E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
+E2E_MOE_FRONT=1 python run_e2e_compare.py
+```
+
+该命令的 baseline 关闭三组 Mega 开关，mega 轮同时打开 CSA、HCA 和
+`DSV4_MEGA_MOE_FRONT`；脚本会在启动参数中保持 TP1/EP4/world4，并对相同 greedy
+请求做 token 级结果比较。
+
 脚本封装的关键运行要素（手工起 server 时同样必需）：
 `MODEL_TYPE=deepseek_v4`、`CHECKPOINT_PATH`/`TOKENIZER_PATH`、`START_PORT`；
 `--load_method scratch --act_type BF16 --fp8_kv_cache 1 --seq_size_per_block 256`

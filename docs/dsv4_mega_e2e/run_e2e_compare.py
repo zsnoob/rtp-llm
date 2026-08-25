@@ -7,7 +7,11 @@ both, and diffs the outputs token-by-token.
 
 Environment:
     E2E_CKPT    (required) checkpoint dir, e.g. a DeepSeek-V4-Flash checkout
-    E2E_GPU     CUDA device index (default 0)
+    E2E_GPU     CUDA device list (default 0; use 0,1,2,3 for EP4)
+    E2E_EP_SIZE expert-parallel size (default 1; native MoE front needs >1)
+    E2E_WORLD_SIZE distributed world size (default E2E_EP_SIZE)
+    E2E_LOCAL_WORLD_SIZE local ranks on this host (default E2E_WORLD_SIZE)
+    E2E_MOE_FRONT set to 1 to enable the native four-kernel Pro MoE front
     E2E_PYTHON  python of a serving-capable venv (default: this interpreter)
     E2E_OUT     output dir for logs/results (default ./e2e_out)
     E2E_JIT_CACHE  base dir for the managed JIT caches (default ~/.cache/rtp_jit)
@@ -28,6 +32,19 @@ if not CKPT:
     sys.exit("E2E_CKPT must point at a DSV4 checkpoint directory")
 PORT = int(os.environ.get("E2E_PORT", "18901"))
 GPU = os.environ.get("E2E_GPU", "0")
+EP_SIZE = int(os.environ.get("E2E_EP_SIZE", "1"))
+WORLD_SIZE = int(os.environ.get("E2E_WORLD_SIZE", str(EP_SIZE)))
+LOCAL_WORLD_SIZE = int(
+    os.environ.get("E2E_LOCAL_WORLD_SIZE", str(WORLD_SIZE))
+)
+MOE_FRONT = os.environ.get("E2E_MOE_FRONT", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+if MOE_FRONT and EP_SIZE <= 1:
+    sys.exit("E2E_MOE_FRONT=1 requires E2E_EP_SIZE > 1")
 OUT_DIR = Path(os.environ.get("E2E_OUT", "e2e_out"))
 SERVER_ARGS = [
     "--start_port",
@@ -45,9 +62,11 @@ SERVER_ARGS = [
     "--dp_size",
     "1",
     "--ep_size",
-    "1",
+    str(EP_SIZE),
     "--world_size",
-    "1",
+    str(WORLD_SIZE),
+    "--local_world_size",
+    str(LOCAL_WORLD_SIZE),
     "--seq_size_per_block",
     "256",
     "--kv_cache_mem_mb",
@@ -83,6 +102,7 @@ def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
             "TOKENIZER_PATH": CKPT,
             "START_PORT": str(PORT),
             "CUDA_VISIBLE_DEVICES": GPU,
+            "WORLD_RANK": "0",
             "DG_JIT_CPP_STANDARD": "20",
             "LOG_PATH": str(OUT_DIR / f"{tag}_logs"),
         }
@@ -210,6 +230,7 @@ def main() -> None:
             {
                 "DSV4_MEGA_CSA": "0",
                 "DSV4_MEGA_HCA": "0",
+                "DSV4_MEGA_MOE_FRONT": "0",
             },
         )
     if only in (None, "mega"):
@@ -218,6 +239,7 @@ def main() -> None:
             {
                 "DSV4_MEGA_CSA": "1",
                 "DSV4_MEGA_HCA": "1",
+                "DSV4_MEGA_MOE_FRONT": "1" if MOE_FRONT else "0",
             },
         )
     if len(runs) < 2:
