@@ -496,6 +496,32 @@ kernel count 全部为 4，M128 Perfetto 也恰好显示上述四个 semantic ke
 SHA256 为 `18957fc602c99ca04690192847b269fe4c95304606bc8f0b0bad4dfb092a5c19`。该表只覆盖
 MoE front，不能当作 expert core、EP communication、mHC post 或完整 DecoderLayer 延迟。
 
+### 2026-08-25：官方 MegaMoE-SE 组件级 A/B（非 RTP wheel e2e）
+
+本地保留了一组独立于 RTP adapter 的官方 MegaMoE graph A/B，控制变量为同一随机种子
+`20260825`、同一 shape `(tokens=64,max_tokens=128,experts=384,topk=6)`、同一
+DeepGEMM commit `559d79fb6994a58b8a15b4b93bf13ccc16edf247`，唯一变量是
+`num_shared_experts=0/1`。设备 capability 由 PyTorch 记录为 `(10,3)`，每个变体 4 rank、
+30 warm + 10 cold samples，cold 前同 stream flush 8 GiB：
+
+| 变体 | 4-rank envelope median | rank-max envelope median | warm CUDA-event median | cold CUDA-event median |
+| --- | ---: | ---: | ---: | ---: |
+| no-SE | 661.168 us | 678.111 us | 556.640 us | 693.440 us |
+| MegaMoE-SE | 661.550 us | 682.622 us | 571.088 us | 696.128 us |
+
+在同一份 internal phase trace 中，Dispatch duration 为：no-SE
+`36.896/36.992/151.360/88.288 us`、SE `41.824/61.856/90.656/86.240 us`（rank 0..3）。
+shared expert 的 L1/L2 阶段会占用资源并改变 dispatch overlap，但该 workload 的总 envelope
+没有稳定拉开；rank 2 的 no-SE dispatch 尾延迟反而更大。原始证据为
+`artifacts/megamoe-se-ab-4xb300-20260825/summary.json`（SHA256
+`fcfe0c06679461f7b03a6cbc7729070aa30b1ba44bd5416ac9eab229ebcd22c4`）和
+`internal_phase_ab_summary.json`（SHA256
+`72012978b3bd493a571a11f9356bc71af21aba35fe6c260e28d0a267e02835f4`）。
+
+这组数据只证明官方 MegaMoE 内部的 SE 资源/overlap 行为，不证明 RTP 的
+`Dsv4MoeFrontPlan`、CSA/HCA、expert core 和完整 decoder layer 已经通过 wheel e2e；后者仍以
+§6 的 EP4 serving 和 logits/layer trajectory 为准。
+
 RTP 生产接入由以下部分组成：
 
 1. `moe/native_front.py` 负责完整 Plan ABI/geometry 校验、模型级 capacity-128 workspace、
