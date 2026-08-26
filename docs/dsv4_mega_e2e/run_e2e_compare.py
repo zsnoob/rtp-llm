@@ -9,6 +9,8 @@ Environment:
     E2E_CKPT    (required) checkpoint dir, e.g. a DeepSeek-V4-Flash checkout
     E2E_GPU     CUDA device list (default 0; use 0,1,2,3 for EP4)
     E2E_EP_SIZE expert-parallel size (default 1; native MoE front needs >1)
+    E2E_TP_SIZE tensor-parallel size (default 1)
+    E2E_DP_SIZE data-parallel size (default 1; EP4 recipe uses 4)
     E2E_WORLD_SIZE distributed world size (default E2E_EP_SIZE)
     E2E_LOCAL_WORLD_SIZE local ranks on this host (default E2E_WORLD_SIZE)
     E2E_MOE_FRONT set to 1 to enable the native four-kernel Pro MoE front
@@ -30,9 +32,25 @@ VENV_PY = os.environ.get("E2E_PYTHON", sys.executable)
 CKPT = os.environ.get("E2E_CKPT")
 if not CKPT:
     sys.exit("E2E_CKPT must point at a DSV4 checkpoint directory")
+
+
+def validate_checkpoint(path: str) -> None:
+    checkpoint = Path(path)
+    if not checkpoint.is_dir():
+        sys.exit(f"E2E_CKPT is not a directory: {checkpoint}")
+    if not (checkpoint / "config.json").is_file():
+        sys.exit(
+            "E2E_CKPT is missing config.json; point it at a populated "
+            f"DeepSeek-V4 snapshot, not an empty cache directory: {checkpoint}"
+        )
+
+
+validate_checkpoint(CKPT)
 PORT = int(os.environ.get("E2E_PORT", "18901"))
 GPU = os.environ.get("E2E_GPU", "0")
 EP_SIZE = int(os.environ.get("E2E_EP_SIZE", "1"))
+TP_SIZE = int(os.environ.get("E2E_TP_SIZE", "1"))
+DP_SIZE = int(os.environ.get("E2E_DP_SIZE", "1"))
 WORLD_SIZE = int(os.environ.get("E2E_WORLD_SIZE", str(EP_SIZE)))
 LOCAL_WORLD_SIZE = int(
     os.environ.get("E2E_LOCAL_WORLD_SIZE", str(WORLD_SIZE))
@@ -58,9 +76,9 @@ SERVER_ARGS = [
     "--act_type",
     "BF16",
     "--tp_size",
-    "1",
+    str(TP_SIZE),
     "--dp_size",
-    "1",
+    str(DP_SIZE),
     "--ep_size",
     str(EP_SIZE),
     "--world_size",
@@ -95,6 +113,16 @@ QUERIES = [
 
 def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
     env = os.environ.copy()
+    # The WebIDE image may export a PYTHONPATH for an older RTP checkout.  A
+    # mixed source/native ABI makes ``rtp_llm.ops`` discover that old
+    # libth_transformer_config.so, so the serving child must see only this
+    # staged checkout (plus the normal site-packages supplied by VENV_PY).
+    source_root_env = os.environ.get("E2E_SOURCE_ROOT")
+    repo_root = (
+        Path(source_root_env)
+        if source_root_env
+        else Path(__file__).resolve().parents[2]
+    )
     env.update(
         {
             "MODEL_TYPE": "deepseek_v4",
@@ -105,6 +133,7 @@ def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
             "WORLD_RANK": "0",
             "DG_JIT_CPP_STANDARD": "20",
             "LOG_PATH": str(OUT_DIR / f"{tag}_logs"),
+            "PYTHONPATH": str(repo_root),
         }
     )
     # /tmp/rtp-llm belongs to another user in this container; preset every
@@ -142,7 +171,13 @@ def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
 # Full V4-Flash (156GB) loads from NAS at ~4GB/min plus first-run JIT;
 # 30 minutes is not enough.
 def wait_ready(proc: subprocess.Popen, timeout: int = 5400) -> bool:
-    sys.path.insert(0, str(Path(VENV_PY).parents[1] / "lib/python3.10/site-packages"))
+    source_root = os.environ.get("E2E_SOURCE_ROOT")
+    if source_root:
+        sys.path.insert(0, source_root)
+    else:
+        sys.path.insert(
+            0, str(Path(VENV_PY).parents[1] / "lib/python3.10/site-packages")
+        )
     from rtp_llm.utils.util import wait_sever_done
 
     return wait_sever_done(proc, PORT, timeout)

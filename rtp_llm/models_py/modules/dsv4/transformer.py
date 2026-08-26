@@ -9,7 +9,7 @@ mock per-layer KV cache before wiring into RTP-LLM's GptModelBase.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn

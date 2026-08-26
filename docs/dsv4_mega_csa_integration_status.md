@@ -788,3 +788,74 @@ Mega 轮在 target 的 `envs` 里加 `DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`。gol
 `test.outputs/outputs.zip` 里有每条 query 的 actual dump）；正式收编需按框架惯例
 生成本环境 per-配置 golden。smoke 宏会自动注入 `DETERMINISTIC_GEMM=1` 与
 `DSV4_INDEXER_TOPK_CANONICALIZE=1`。
+
+### 8.5 2026-08-26 wheel 集成复核（SM103 / 4 卡）
+
+本轮在 WebIDE 的四卡目标机上完成了 CUDA Extension wheel 的实际构建、安装和
+ABI 冒烟。设备架构只通过 PyTorch `torch.cuda.get_device_capability()` 读取，四张卡
+均返回 `(10, 3)`，CUDA runtime 为 13.0；没有使用 `nvidia-smi` 作为架构判断来源。
+
+构建输入和产物证据：
+
+```text
+cuda_extension source: c81d23db7f10a7ad6bf00a9535d30e207fef66c4
+embedded source sha256: 5d9d222c7cd32c0969b2ed6cca25ffd837c07eddc07e3d204221179e32221ee0
+wheel tag: rtp-kernel-0.1.0+c81d23db7f10a7ad6bf00a9535d30e207fef66c4.20260826061454.cu130
+target: sm_103a
+modules: rtp_ops + rtp_ops_dsv4_mega
+moe-front kernels: 4
+geometry: hidden=7168, hc_mult=4, hc_width=24, experts=384, topk=6,
+          max_m=128, scale_cols=56, collapse_ssq_bits=32
+```
+
+安装后 `rtp_ops`、`rtp_ops_dsv4_mega` 和 `rtp_kernel.dsv4_mega` 均可导入；
+`geometry_moe_front()` / `build_info_moe_front()` 返回上述合约。生产运行必须安装
+完整 wheel，不能使用 `DSV4_MEGA_ONLY=1` 过滤掉普通 `rtp_ops`。
+
+E2E runner `docs/dsv4_mega_e2e/run_e2e_compare.py` 本轮补齐了四个可复现性要求：
+
+* `E2E_TP_SIZE`、`E2E_DP_SIZE` 可配置，四卡 EP 使用 `TP=1, DP=4, EP=4`；
+* child 和 health-check parent 都固定到 `E2E_SOURCE_ROOT`，清除旧 venv 的
+  `PYTHONPATH`，避免加载不匹配的 `libth_transformer_config.so`；
+* JIT cache、`watchdog` 等 serving 依赖由运行环境显式准备。
+* 启动前检查 `E2E_CKPT` 是 populated snapshot 且含 `config.json`，避免空缓存目录
+  触发长时间 server 启动后才在 tokenizer 阶段失败。
+
+远端 staged checkout 在首次适配层收集时暴露了
+`dsv4/transformer.py` 缺少 `typing.Tuple` 导入的问题；已补齐并重新同步。匹配
+native ABI 的 WebIDE 环境中，修复后的结果为：
+
+```text
+test_mega_moe_native_front.py: 10 passed in 2.37s
+test_mega_moe_input_packer.py + test_mega_moe_se_input_pack.py
+  + test_mega_moe_gate_pack.py: 14 passed, 9 subtests passed in 4.98s
+```
+
+这些测试覆盖 native-front ABI 检查、workspace/plan 生命周期、稳定 128-row
+buffer、shared-expert publication、输入 pack、SE pack 和 gate pack；它们不代替真实
+权重上的 token 生成测试。
+
+四卡 server 已通过 native ABI、EP 参数和启动链路检查，但本轮不能给出 token 级
+baseline/Mega TPS 或 Perfetto 对比：指定的 checkpoint
+
+```text
+/mnt/fuse/.cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/
+snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+```
+
+在目标机上是空目录（无 `config.json`、tokenizer 或权重）。因此服务最终在 tokenizer
+初始化处停止，而不是在 MoE-front、CSA 或 HCA 算子处失败。重现真实端到端前，需把
+`E2E_CKPT` 指向实际挂载的 DeepSeek-V4-Flash/Pro 快照；快照可见后直接运行：
+
+```bash
+E2E_CKPT=<实际快照> \
+E2E_GPU=0,1,2,3 E2E_TP_SIZE=1 E2E_DP_SIZE=4 \
+E2E_EP_SIZE=4 E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
+E2E_MOE_FRONT=1 python docs/dsv4_mega_e2e/run_e2e_compare.py
+```
+
+该命令会先跑关闭 Mega 开关的 baseline，再跑同时打开 CSA、HCA 和四-kernel
+MoE-front 的 mega 轮，并对固定 greedy queries 做 token 级比较。当前已获得的性能
+结论仍限于算子层 cold-L2 CUDA Graph envelope：四-kernel MoE-front 的既有结果为
+`25.536 us` median，相对旧 RTP 六-kernel 路径 `32.2405 us`，约 `1.2626x`；本轮未
+把空 checkpoint 的启动失败误报为端到端性能数据。
