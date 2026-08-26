@@ -848,6 +848,14 @@ snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
 初始化处停止，而不是在 MoE-front、CSA 或 HCA 算子处失败。重现真实端到端前，需把
 `E2E_CKPT` 指向实际挂载的 DeepSeek-V4-Flash/Pro 快照；快照可见后直接运行：
 
+本轮同时扫描了 `/mnt`、`/data` 和 `/home/admin/zn`。发现的
+`/home/admin/zn/bf16/csa/vllm_csa/benchmarks/deepseek_v4_csa/model{,_flash}` 只有约
+12 KiB 的配置文件，没有 tokenizer 或权重；可运行的
+`/home/admin/zn/bf16/csa-rtp/fixture{,_hca,_flash}` 是 2 层、1 个 routed expert、
+256 词表的缩小 fixture（约 256--692 MiB），只能用于单卡 smoke，不能替代 EP4/384-expert
+生产 checkpoint。该 fixture 的 DeepGEMM startup JIT 也未在本轮形成可复用的 token/TPS
+基线，因此没有把它混入生产性能结论。
+
 ```bash
 E2E_CKPT=<实际快照> \
 E2E_GPU=0,1,2,3 E2E_TP_SIZE=1 E2E_DP_SIZE=4 \
