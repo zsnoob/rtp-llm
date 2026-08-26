@@ -836,28 +836,30 @@ test_mega_moe_input_packer.py + test_mega_moe_se_input_pack.py
 buffer、shared-expert publication、输入 pack、SE pack 和 gate pack；它们不代替真实
 权重上的 token 生成测试。
 
-四卡 server 已通过 native ABI、EP 参数和启动链路检查，但本轮不能给出 token 级
-baseline/Mega TPS 或 Perfetto 对比：指定的 checkpoint
+四卡 server 已通过 native ABI、EP 参数和启动链路检查。此前检查的 Hugging Face
+缓存 snapshot
 
 ```text
 /mnt/fuse/.cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/
 snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
 ```
 
-在目标机上是空目录（无 `config.json`、tokenizer 或权重）。因此服务最终在 tokenizer
-初始化处停止，而不是在 MoE-front、CSA 或 HCA 算子处失败。重现真实端到端前，需把
-`E2E_CKPT` 指向实际挂载的 DeepSeek-V4-Flash/Pro 快照；快照可见后直接运行：
+在目标机上确实是空目录（无 `config.json`、tokenizer 或权重），但这不是唯一的模型
+存储位置。用户提供并已在同一 WebIDE 复核的
+`/tmp/DeepSeek-V4-Flash-0731` 才是可用的完整 checkpoint：目录含 48 个 safetensors
+分片、`config.json`、`tokenizer.json`，总大小约 167,527,868,432 字节。后续真实端到端
+测试应使用该路径，而不是空的 Hugging Face cache snapshot。
 
-本轮同时扫描了 `/mnt`、`/data` 和 `/home/admin/zn`。发现的
+本轮同时扫描了 `/mnt`、`/data` 和 `/home/admin/zn`；第一次扫描漏读了 `/tmp` 下的
+完整 checkpoint，结论已在本节更正。发现的
 `/home/admin/zn/bf16/csa/vllm_csa/benchmarks/deepseek_v4_csa/model{,_flash}` 只有约
 12 KiB 的配置文件，没有 tokenizer 或权重；可运行的
 `/home/admin/zn/bf16/csa-rtp/fixture{,_hca,_flash}` 是 2 层、1 个 routed expert、
 256 词表的缩小 fixture（约 256--692 MiB），只能用于单卡 smoke，不能替代 EP4/384-expert
-生产 checkpoint。该 fixture 的 DeepGEMM startup JIT 也未在本轮形成可复用的 token/TPS
-基线，因此没有把它混入生产性能结论。
+生产 checkpoint。此前 fixture 的 DeepGEMM startup JIT 结果不计入生产性能结论。
 
 ```bash
-E2E_CKPT=<实际快照> \
+E2E_CKPT=/tmp/DeepSeek-V4-Flash-0731 \
 E2E_GPU=0,1,2,3 E2E_TP_SIZE=1 E2E_DP_SIZE=4 \
 E2E_EP_SIZE=4 E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
 E2E_MOE_FRONT=1 python docs/dsv4_mega_e2e/run_e2e_compare.py
@@ -866,5 +868,6 @@ E2E_MOE_FRONT=1 python docs/dsv4_mega_e2e/run_e2e_compare.py
 该命令会先跑关闭 Mega 开关的 baseline，再跑同时打开 CSA、HCA 和四-kernel
 MoE-front 的 mega 轮，并对固定 greedy queries 做 token 级比较。当前已获得的性能
 结论仍限于算子层 cold-L2 CUDA Graph envelope：四-kernel MoE-front 的既有结果为
-`25.536 us` median，相对旧 RTP 六-kernel 路径 `32.2405 us`，约 `1.2626x`；本轮未
-把空 checkpoint 的启动失败误报为端到端性能数据。
+`25.536 us` median，相对旧 RTP 六-kernel 路径 `32.2405 us`，约 `1.2626x`；使用完整
+`/tmp` checkpoint 的 EP4 token/TPS/Perfetto 测试待启动命令稳定执行后补录，不能用
+fixture 结果替代。
