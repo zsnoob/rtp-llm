@@ -1,6 +1,6 @@
 # DSV4 Mega CSA/HCA TP1 接入状态与后续方案
 
-更新日期：2026-08-25
+更新日期：2026-08-26
 
 ## 1. 当前结论
 
@@ -8,9 +8,10 @@ DSV4 Mega CSA 的开源框架适配已经进入生产 decode 层循环。TP1 单
 sublayer 的数值对照、eager、CUDA Graph 和 slot reuse 已通过。2026-08-18 起本地整模型
 serving 端到端已跑通（裁层 DSV4-Pro）；2026-08-19 起 **全量 DeepSeek-V4-Flash（43 层，
 单卡）端到端跑通**，baseline 与 Mega（CSA+HCA 双开）输出语义等价，仅在近平局 token 处
-出现 greedy 分岔（与框架 smoke 对不同拓扑使用各自 golden 的既有现象同类）。框架公共
-CUDA13 `rtp-kernel` wheel 仍不含 Mega 扩展；当前所有验证使用本地 wheel + 未提交的本地
-lock 补丁，发布制品后才能推平公共依赖。
+出现 greedy 分岔（与框架 smoke 对不同拓扑使用各自 golden 的既有现象同类）。本轮已在
+四卡 SM103 WebIDE 构建并安装包含 `rtp_ops` 与 `rtp_ops_dsv4_mega` 的 CUDA13 wheel，
+完成 native-front、输入 pack、SE pack 和 gate pack 适配测试；公共 CUDA13 requirements
+lock 仍需发布该 wheel 后再更新，不能把 staged wheel 当成公共依赖已经上线。
 
 2026-08-19 起，同一 extension 二进制内同时编译 **DSV4-Pro 与 DSV4-Flash 两套 CSA 几何**
 （Pro: dim 7168 / q_lora 1536 / 128 heads / o_groups 16；Flash: 4096 / 1024 / 64 / 8），
@@ -64,7 +65,7 @@ DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完
 ### 2026-08-26：CUDA13 wheel release gate
 
 RTP 集成代码与 release metadata 已推送到 `zsnoob/rtp-llm:dsv4-mega`，当前提交为
-`cbd82fd5d`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
+`25bd97f74`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
 可复现源码归档（SHA256
 `e07f90609eedab9247983b7426726c20274edc1a7493f2d828122802a6046873`），其 MoE-front
 source fingerprint 为
@@ -73,10 +74,10 @@ source fingerprint 为
 `rtp_ops`、`rtp_ops_dsv4_mega`、四-kernel contract 和 build identity。
 
 本机已完成源码 fingerprint、脚本语法、Python compileall、文档 diff 和历史四-kernel
-artifact 校验；真实 CUDA13/SM103 wheel 构建、EP4 MoE block 正确性以及 CSA+HCA+MoE
-front 完整生成仍是 release gate，必须在可访问的四卡 WebIDE 上执行。当前 Mac 缺少
-CUDA toolchain，现有远端地址的 SSH/WebIDE 会话也不可达，因此本节不把历史组件级或
-算子级结果记为当前 wheel 的端到端通过。
+artifact 校验；四卡 WebIDE 已完成 CUDA13/SM103 wheel 构建、安装和 EP4 适配层测试。
+当前 release gate 只剩真实权重上的 EP4 MoE block 数值回归、CSA+HCA+MoE front 完整
+token 生成和对应 TPS/Perfetto；目标 checkpoint 目前为空，不能把组件级或算子级结果
+记为完整端到端通过。
 
 ## 2. 支持边界
 
@@ -586,7 +587,7 @@ logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 P
 
 按阻塞顺序还需要：
 
-1. 发布远端 `dsv4_megakernel@c81d23d` 对应的 CUDA13 x86_64 wheel，更新开源/内源
+1. 将已构建的远端 `dsv4_megakernel@c81d23d` CUDA13 x86_64 wheel 发布到开源/内源
    实际使用的依赖入口和 lock；本地 `dc880c9` 只移除了 benchmark 的 inventory-tool
    查询，不改变 wheel 源文件或 `DSV4_MOE_FRONT_SOURCE_SHA256`；
 2. 增加由真实 `KVCacheManager` 创建 typed pools/block tables 的集成测试，替代手工 pool
@@ -594,7 +595,7 @@ logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 P
 3. ~~校验 normal prefill -> Mega decode~~ 已在裁层 Pro 与全量 Flash serving 中覆盖
    （target verify / MTP 场景仍未覆盖）；
 4. 整模型正确性收口：为 Mega 配置生成 per-配置 golden（框架 smoke 惯例），并在健康模型
-   上完成 logits 级对照（Flash 对照排队中）；建议同时把 4 层 Pro 裁层 checkpoint 上传 NAS
+   上完成 logits 级对照（Flash 对照已完成，Pro/EP4 完整模型待真实 checkpoint）；建议同时把 4 层 Pro 裁层 checkpoint 上传 NAS
    并新增 `v4_pro_4layer_tp1` / `..._mega` smoke case；
 5. 测量开关关闭时普通 FP8 整模型路径，确认新增 Python 分支不可测；
 6. 对 normal FP8 与 Mega FP8 做真实模型、代表性长上下文和完整 batch grid 性能 A/B。
