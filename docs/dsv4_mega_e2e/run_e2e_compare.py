@@ -16,6 +16,8 @@ Environment:
     E2E_LOCAL_WORLD_SIZE local ranks on this host (default E2E_WORLD_SIZE)
     E2E_MOE_FRONT set to 1 to enable the native four-kernel Pro/Flash MoE front
     E2E_PYTHON  python of a serving-capable venv (default: this interpreter)
+    E2E_SOURCE_ROOT staged RTP source root (default: infer from this script)
+    E2E_KERNEL_ROOT optional clean-wheel install root for extension overrides
     E2E_OUT     output dir for logs/results (default ./e2e_out)
     E2E_JIT_CACHE  base dir for the managed JIT caches (default ~/.cache/rtp_jit)
 """
@@ -137,6 +139,15 @@ def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
         if source_root_env
         else Path(__file__).resolve().parents[2]
     )
+    python_roots = [str(repo_root)]
+    kernel_root_env = os.environ.get("E2E_KERNEL_ROOT")
+    if kernel_root_env:
+        kernel_root = Path(kernel_root_env)
+        if not kernel_root.is_dir():
+            raise RuntimeError(
+                f"E2E_KERNEL_ROOT is not a directory: {kernel_root}"
+            )
+        python_roots.append(str(kernel_root))
     env.update(
         {
             "MODEL_TYPE": "deepseek_v4",
@@ -147,7 +158,7 @@ def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
             "WORLD_RANK": "0",
             "DG_JIT_CPP_STANDARD": "20",
             "LOG_PATH": str(OUT_DIR / f"{tag}_logs"),
-            "PYTHONPATH": str(repo_root),
+            "PYTHONPATH": os.pathsep.join(python_roots),
         }
     )
     # /tmp/rtp-llm belongs to another user in this container; preset every
