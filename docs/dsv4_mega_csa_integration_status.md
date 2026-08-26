@@ -1,6 +1,6 @@
 # DSV4 Mega CSA/HCA TP1 接入状态与后续方案
 
-更新日期：2026-08-26
+更新日期：2026-08-27
 
 ## 1. 当前结论
 
@@ -56,30 +56,29 @@ Block.forward_decode
 ```
 
 当前 attention adapter 仍只替换 attention sublayer。本分支同时增加了可独立启用的
-四-kernel native MoE front：在 DSV4-Pro decode、TP1、MegaMoE-SE 且底层 storage 满足
-capacity-128 时，整体替换
+四-kernel native MoE front：在 DSV4-Pro/Flash decode、TP1、MegaMoE-SE 且底层 storage
+满足 capacity-128 时，整体替换
 `ffn_hc.pre -> ffn_norm -> router F.linear -> Triton gate-pack`，并直接发布到官方
 DeepGEMM expert core 已有的 symmetric buffer。开关、回退条件和待完成的发布验证见下文
 “B300 四-kernel MoE front 生产接入”。model head mHC 仍不在 Mega 替换范围内。
 
-### 2026-08-26：CUDA13 wheel release gate
+### 2026-08-27：CUDA13 wheel release gate
 
-RTP 集成代码与 release metadata 已推送到 `zsnoob/rtp-llm:dsv4-mega`，当前提交为
-`5fa55d3ac`。CUDA extension 的可发布源码固定为 `dsv4_megakernel@c81d23d`；本地已准备
-可复现源码归档（SHA256
-`e07f90609eedab9247983b7426726c20274edc1a7493f2d828122802a6046873`），其 MoE-front
+本轮开始前 `zsnoob/rtp-llm:dsv4-mega` 基线为 `13cf5ac42`；本轮在其后增加 Flash
+native-front contract v2、官方 MegaMoE-SE ABI 修复和受控 TPS runner。CUDA extension
+的可发布源码
+固定为 `dsv4_megakernel@45a7cb785960e7c190613b53841d23ad938e91ca`，其 MoE-front
 source fingerprint 为
-`5d9d222c7cd32c0969b2ed6cca25ffd837c07eddc07e3d204221179e32221ee0`。构建脚本只用
+`669737a1406acd5f15109f2fd73b1cc9c11e7d24b4347f16f183f8d39759f5d6`。构建脚本只用
 `torch.cuda.get_device_capability()` 检查四张设备均为 `(10,3)`，并在安装后验证完整
-`rtp_ops`、`rtp_ops_dsv4_mega`、四-kernel contract 和 build identity。
+`rtp_ops`、`rtp_ops_dsv4_mega`、四-kernel contract v2 和 build identity。
 
-本机已完成源码 fingerprint、脚本语法、Python compileall、文档 diff 和历史四-kernel
-artifact 校验；四卡 WebIDE 已完成 CUDA13/SM103 wheel 构建、安装和 EP4 适配层测试。
-当前 release gate 只剩 **DSV4-Pro** 真实权重上的 EP4 MoE block 数值回归、
-CSA+HCA+四-kernel MoE front 完整 token 生成和对应 TPS/Perfetto。目标机已经找到并完成
-DSV4-Flash 全量 checkpoint 的 EP4 生成与 TPS 对照，但 Flash 的 `D=4096/E=256` 不满足
-native front 固定的 Pro `D=7168/E=384` ABI，不能把 Flash 结果记成四-kernel front
-端到端通过。
+clean operator wheel SHA256 为
+`b5a84c0c6ff2c68a3a61e106e3d8d5fa396a5b16975f22e0a79f03d950bd5d16`。四卡 WebIDE
+已完成该 wheel 的 SM103 构建、安装、逐 M 正确性/性能、Flash EP4 token 生成和受控 TPS
+A/B；完整 checkpoint 为 `/tmp/DeepSeek-V4-Flash-0731`。当前 release gate 剩余
+DSV4-Pro 真实权重 EP4 回归、HashMoE 整模型回归、CUDA Graph serving A/B 和正式 wheel
+发布/lock 更新；Flash learned-routing eager serving 已通过。
 
 ## 2. 支持边界
 
@@ -89,7 +88,7 @@ native front 固定的 Pro `D=7168/E=384` ABI，不能把 Flash 结果记成四-
 | 并行 | attention adapter：TP1、单进程；MoE front：TP1 + EP 多 rank（MegaMoE-SE） | attention 与 MoE 分别独立选路 |
 | KV cache | FP8 | 非 FP8 初始化失败 |
 | 层类型 | `compress_ratio == 4` 的 CSA 层（`DSV4_MEGA_CSA`）；`compress_ratio == 128` 的 HCA 层（`DSV4_MEGA_HCA`） | 按 ratio 分别挂 adapter |
-| 模型几何 | DSV4-Pro（dim 7168）与 DSV4-Flash（dim 4096） | `GEOMETRY_BY_DIM` 按 `attn.dim` 选 profile，其他 dim 初始化失败 |
+| 模型几何 | DSV4-Pro（dim 7168 / 384 experts）与 DSV4-Flash（dim 4096 / 256 experts） | attention 与 MoE front 均按 hidden dim 选 profile，其他 dim 初始化失败 |
 | 请求形态 | decode、`q_len == 1`、batch 1..128；MoE front 还要求 capacity-128 storage | 其余形态走现有路径 |
 | 进程角色 | `DECODE` 和单卡 `PDFUSION` | 由 `forward_decode` 限制实际执行 |
 | 开关 | `DSV4_MEGA_CSA=1` / `DSV4_MEGA_HCA=1` / `DSV4_MEGA_MOE_FRONT=1` | 各自默认关闭，模型构造期固定；MoE 使用独立 runtime |
@@ -470,6 +469,10 @@ MoE 耗时按 batch 归一化，取 4 个 context、baseline/Mega 以及 CSA/HCA
 
 ### 2026-08-25：B300 四-kernel MoE front 生产接入
 
+本节保留最初 Pro-only contract v1 的测量记录。2026-08-27 的双几何 contract v2、TopK
+替换、clean wheel 和完整 Flash EP4 结果见 §8.7；其中的新结果取代本节的 Pro-only 支持边界，
+但不改写下表历史测量值。
+
 `Flash_DeepSeek_V4_Pro` 的 Mega-MoE provider 已把 decode FFN front 收敛为以下四个
 有序 kernel，支持 logical `1 <= M <= 128`，workspace 保持 capacity 128：
 
@@ -491,7 +494,7 @@ learned V4 TopK-6。HashMoE 保持独立 checkpoint-table route publication。
 `run_learned_out`/`run_hash_out`。Plan 绑定输入与权重指针，所有输出 workspace 由 caller
 持有；front 按官方 MegaMoE buffer ABI 发布，随后继续调用现有
 `deep_gemm.fp8_fp4_mega_moe`，最后进入 mHC post。provider 还必须通过
-`geometry_moe_front()` 报告 `kernel_contract_version=1`；缺少该握手的旧 wheel 会被拒绝，
+`geometry_moe_front()` 报告 `kernel_contract_version=2`；缺少该握手的旧 wheel 会被拒绝，
 避免同一 Python 签名静默落到旧 `hc_gemm_splitk_kernel`。
 
 SM103（148 SM、CUDA 13.0、PyTorch 2.11.0+cu130、DeepGEMM
@@ -553,17 +556,19 @@ RTP 生产接入由以下部分组成：
    `forward_prepacked` 直接消费，不增加 publication copy kernel；symmetric buffer 可拥有多于
    128 行，但 Plan ABI 要求精确 `[128,...]`，因此 adapter 为四个 row-major publication
    tensor 创建同 data pointer 的精确 capacity view，不产生 copy 或第五个 kernel；
-4. RTP 的 logical residual 是 `[M,1,4,7168]`，provider Plan 要求固定
-   `[128,4,7168]`。decode 入口把原 HC `repeat` publication 改为写模型级 capacity-128
+4. RTP 的 logical residual 是 `[M,1,4,D]`，provider Plan 要求固定
+   `[128,4,D]`，其中 `D` 由 Pro/Flash profile 得到。decode 入口把原 HC `repeat`
+   publication 改为写模型级 capacity-128
    buffer，并一次 staging capacity-128 `input_ids`；此后 HC post 原地复用该 residual
    storage。adapter 创建同指针 `as_strided` capacity view；外部调用若没有该容量则回退旧
    路径，禁止在四-kernel front 内补 copy；
 5. HashMoE layers 使用 INT32 `tid2eid` 和 capacity-128 INT64 `input_ids`；learned layers 使用
-   FP32 correction bias。prefill、MTP、`M > 128`、非 Pro geometry、非 MegaMoE-SE、短 storage
-   均保留原实现；
+   FP32 correction bias。prefill、MTP、`M > 128`、未广告的 geometry、非 MegaMoE-SE、短
+   storage 均保留原实现；
 6. 模型初始化开关为 `DSV4_MEGA_MOE_FRONT=1`，并必须同时设置
-   `DSV4_USE_MEGA_MOE_SE=1` 选择带 shared expert 的 Mega strategy。当前只允许
-   `D=7168/E=384/TopK=6/hc=4/TP=1/EP>1`，运行时再通过
+   `DSV4_USE_MEGA_MOE_SE=1` 选择带 shared expert 的 Mega strategy。当前允许
+   Pro `D=7168/E=384` 和 Flash `D=4096/E=256`，两者均为 `TopK=6/hc=4/TP=1/EP>1`；
+   运行时再通过
    `torch.cuda.get_device_capability()` 校验设备 capability 必须为 `(10,3)`。当前
    four-kernel C++ plan 只实现 SM103；SM100 仍仅适用于 CSA/HCA attention adapter。
 
@@ -582,16 +587,17 @@ bazel test --config=cuda13 \
 logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 Perfetto。
 仓库 Bazel target 已进入依赖解析，但该机器访问 `bazel_skylib-1.0.2.tar.gz` 的内部 OSS
 镜像超时，因此不把本轮记为 Bazel test pass。
-正式发布仍需把匹配 ABI/contract 的 wheel 固定到构建依赖，并完成真实 EP4 CUDA Graph
-和完整 MoE block 数值回归；单 rank adapter 四-kernel Perfetto 已完成。
+正式发布仍需把匹配 ABI/contract 的 wheel 固定到构建依赖；Flash learned-routing EP4 eager
+serving 与 TPS 已完成，剩余 Pro/HashMoE 完整回归和 EP4 CUDA Graph serving A/B。单 rank
+adapter 四-kernel Perfetto 已完成。
 
 ## 6. 端到端剩余缺口
 
 按阻塞顺序还需要：
 
-1. 将已构建的远端 `dsv4_megakernel@c81d23d` CUDA13 x86_64 wheel 发布到开源/内源
-   实际使用的依赖入口和 lock；本地 `dc880c9` 只移除了 benchmark 的 inventory-tool
-   查询，不改变 wheel 源文件或 `DSV4_MOE_FRONT_SOURCE_SHA256`；
+1. 将已验证的 `dsv4_megakernel@45a7cb7` CUDA13 x86_64 wheel 发布到开源/内源实际使用的
+   依赖入口和 lock；发布件必须保持 source fingerprint `669737a1...39759f5d6`、contract v2
+   和 `sm_103a` production arch；
 2. 增加由真实 `KVCacheManager` 创建 typed pools/block tables 的集成测试，替代手工 pool
    fixture（本地 serving e2e 已实际走真实 allocator，但缺 bazel 内可回归的形式）；
 3. ~~校验 normal prefill -> Mega decode~~ 已在裁层 Pro 与全量 Flash serving 中覆盖
@@ -601,9 +607,9 @@ logical `M=16/32/64/96/128`、正确性、warm/cold-L2 Graph envelope 和 M128 P
    并新增 `v4_pro_4layer_tp1` / `..._mega` smoke case；
 5. 测量开关关闭时普通 FP8 整模型路径，确认新增 Python 分支不可测；
 6. 对 normal FP8 与 Mega FP8 做真实模型、代表性长上下文和完整 batch grid 性能 A/B。
-7. 发布包含 `Dsv4MoeFrontPlan` 与 `kernel_contract_version=1` 的 CUDA13 wheel，并完成
-   HashMoE 与 EP4 多 rank 的完整 MoE block 验证；learned routing 的单 rank CUDA Graph、
-   四-kernel Perfetto timeline 已完成。
+7. 发布包含 `Dsv4MoeFrontPlan` 与 `kernel_contract_version=2` 的 CUDA13 wheel，并完成
+   Pro/HashMoE 与 EP4 CUDA Graph serving 验证；Flash learned routing 的 EP4 eager serving、
+   单 rank CUDA Graph 和四-kernel Perfetto timeline 已完成。
 
 性能报告至少应单列：
 
@@ -720,18 +726,20 @@ E2E_CKPT=... ./watch_and_run_logits.sh                        # 轮询空卡自�
 DSV4_PRO_SRC=<全量 Pro 目录> python truncate_dsv4_pro.py --layers 4 --out <目录>
 ```
 
-上述默认脚本是单卡 CSA/HCA 对照，`EP=1` 时不会执行 MoE front。Pro/EP4
+上述默认脚本是单卡 CSA/HCA 对照，`EP=1` 时不会执行 MoE front。Pro/Flash EP4
 端到端必须明确使用四张卡和 native front 开关：
 
 ```bash
-E2E_CKPT=<DeepSeek-V4-Pro 目录> \
-E2E_GPU=0,1,2,3 E2E_EP_SIZE=4 E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
+E2E_CKPT=<DeepSeek-V4-Pro/Flash 目录> \
+E2E_GPU=0,1,2,3 E2E_DP_SIZE=4 E2E_EP_SIZE=4 \
+E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
 E2E_MOE_FRONT=1 python run_e2e_compare.py
 ```
 
-该命令的 baseline 关闭三组 Mega 开关，mega 轮同时打开 CSA、HCA 和
-`DSV4_MEGA_MOE_FRONT`；脚本会在启动参数中保持 TP1/EP4/world4，并对相同 greedy
-请求做 token 级结果比较。
+设置 `E2E_MOE_FRONT=1` 后，baseline/mega 两轮都打开 CSA、HCA、MegaMoE 和
+MegaMoE-SE，唯一变量是 `DSV4_MEGA_MOE_FRONT=0/1`；脚本会在启动参数中保持
+TP1/DP4/EP4/world4，并对相同 greedy 请求做 token 级结果比较。加
+`E2E_PERF=1 E2E_PERF_ONLY=1` 可执行固定 64-token warmup + 3x256-token TPS A/B。
 
 脚本封装的关键运行要素（手工起 server 时同样必需）：
 `MODEL_TYPE=deepseek_v4`、`CHECKPOINT_PATH`/`TOKENIZER_PATH`、`START_PORT`；
@@ -742,8 +750,8 @@ cache 环境变量（`FLASHINFER_WORKSPACE_BASE`、`DG_JIT_CACHE_DIR`、`TRTLLM_
 `TRITON_CACHE_DIR`）到自有目录（compare 脚本已代管）；`DG_JIT_CPP_STANDARD=20`。
 Mega 开关：`DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`、
 `DSV4_MEGA_MOE_FRONT=1`、`DSV4_USE_MEGA_MOE_SE=1`（默认全关，即 baseline）。
-MoE front 还要求
-`D=7168/E=384/TopK=6/hc=4/TP=1/EP>1` 和 PyTorch capability `(10,3)`。
+MoE front 还要求 Pro `D=7168/E=384` 或 Flash `D=4096/E=256`，以及
+`TopK=6/hc=4/TP=1/EP>1` 和 PyTorch capability `(10,3)`。
 
 ### 8.4 测试
 
@@ -792,7 +800,7 @@ Mega 轮在 target 的 `envs` 里加 `DSV4_MEGA_CSA=1`、`DSV4_MEGA_HCA=1`。gol
 生成本环境 per-配置 golden。smoke 宏会自动注入 `DETERMINISTIC_GEMM=1` 与
 `DSV4_INDEXER_TOPK_CANONICALIZE=1`。
 
-### 8.5 2026-08-26 wheel 集成复核（SM103 / 4 卡）
+### 8.5 2026-08-26 Pro-only wheel 集成复核（历史记录）
 
 本轮在 WebIDE 的四卡目标机上完成了 CUDA Extension wheel 的实际构建、安装和
 ABI 冒烟。设备架构只通过 PyTorch `torch.cuda.get_device_capability()` 读取，四张卡
@@ -868,7 +876,7 @@ snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
 后强行运行，因为 wheel 的 `geometry_moe_front()`、workspace 和四个 kernel 都使用该
 固定 ABI。
 
-### 8.6 2026-08-26 全量 Flash EP4 token/TPS 实测
+### 8.6 2026-08-26 全量 Flash EP4 CSA/HCA 实测（native front 关闭）
 
 完整 checkpoint `/tmp/DeepSeek-V4-Flash-0731` 已在四张 PyTorch capability `(10,3)`
 设备上以 `TP=1, DP=4, EP=4, world_size=4` 跑通。运行 venv 最初缺少仓库 lock 中的
@@ -906,3 +914,77 @@ tokens warmup，再连续三次生成 256 tokens。启动、权重加载、JIT �
 不包含四-kernel native MoE front。四-kernel front 当前有效证据仍是算子层 cold-L2
 CUDA Graph envelope：`25.536 us` median，相对旧 RTP 六-kernel `32.2405 us` 为
 `1.2626x`；其 Pro EP4 token/TPS/Perfetto 仍需 `D=7168/E=384` 全量权重验证。
+
+### 8.7 2026-08-27 Flash/Pro 四-kernel contract v2 与 EP4 TPS
+
+CUDA extension 固定到 `dsv4_megakernel@45a7cb785960e7c190613b53841d23ad938e91ca`，
+MoE-front source fingerprint 为
+`669737a1406acd5f15109f2fd73b1cc9c11e7d24b4347f16f183f8d39759f5d6`。clean wheel
+SHA256 为 `b5a84c0c6ff2c68a3a61e106e3d8d5fa396a5b16975f22e0a79f03d950bd5d16`；安装
+overlay 为 `/tmp/moe-front-topk-wheel-45a7cb7-only/install`。wheel 同时广告：
+
+```text
+Pro:   D=7168, E=384, scale_cols=56, TopK=6, hc=4, capacity=128
+Flash: D=4096, E=256, scale_cols=32, TopK=6, hc=4, capacity=128
+kernel_contract_version=2, collapse_ssq_bits=32, kernel_count=4
+```
+
+learned TopK 替换为 vLLM DSV4 fast path 的同型算法：每行一个 warp、每 lane 以 `float4`
+载入并把候选保存在寄存器、连续执行六轮 argmax；SM100+ 使用两条
+`redux.sync.max.u32` 完成 value/index 的确定性归约，分数相同时取较小 expert id。standalone
+TopK 与四-kernel 路径的 K4 共用同一 device helper；K4 直接消费 split-K router partial，完成
+FP32 reduce、`sqrt(softplus(logit))`、correction bias、TopK 和归一化，不产生独立 logits
+publication kernel。
+
+同语义 vLLM 对照取 profiler 的 warmed mean kernel body，数值如下：
+
+| M | 本实现 standalone TopK | vLLM DSV4 TopK | 本实现优势 | K4 TopK tail 相对旧实现 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.922133 us | 2.139567 us | 10.16% | 1.485x |
+| 32 | 2.076833 us | 2.296567 us | 9.57% | 1.560x |
+| 64 | 2.133333 us | 2.330700 us | 8.47% | 1.554x |
+| 128 | 2.185567 us | 2.380667 us | 8.20% | 1.528x |
+
+Flash `M=1..128` exhaustive correctness 同时覆盖 standalone PDL on/off 与 fused K4：TopK id
+精确一致，standalone 最大 `calc_diff=4.663e-15`、最大绝对误差 `1.490e-07`；K4 最大
+`calc_diff=6.672e-14`、最大绝对误差 `5.066e-07`，tie 和全负 score case 通过。
+
+RTP 接入同时修正了两个真实 ABI 问题：官方 DeepGEMM MegaMoE-SE 接口接收
+`shared_l1_weights/shared_l2_weights`，但没有 `shared_recipe`；Flash checkpoint 的 shared
+expert UE8M0 scale 是 128x128 block layout，官方 MegaMoE shared path 需要逐 row/每 32 K
+元素的 packed layout。adapter 对 scale 做精确 repeat/pack，保留原 FP8 weight bits，不做
+dequant/requant。Flash checkpoint 的 FFN mHC scale `[3,1]` 在进入 native ABI 前展平为连续
+`[3]`。
+
+全量 `/tmp/DeepSeek-V4-Flash-0731` 在四张 PyTorch capability `(10,3)` 设备上以
+`TP=1, DP=4, EP=4` 完成 baseline/candidate token 生成，clean wheel commit/source/四-kernel
+合约预检通过，candidate 退出码为 0。三条 greedy 输出为 `0/3` 完整字符串一致，因此该轮只
+证明生产调用链可运行，不作为整模型 bitwise 正确性证明；数值正确性以上述逐 M operator
+对照为准。
+
+受控 TPS A/B 中，两轮均固定 `CSA=1, HCA=1, MegaMoE=1, MegaMoE-SE=1`、关闭 CUDA
+Graph、concurrency 1，唯一变量是 `DSV4_MEGA_MOE_FRONT=0/1`。每轮服务 ready 后用同一
+greedy prompt 生成 64 tokens warmup，再连续三次生成 256 tokens；加载、JIT 和清理不计入
+样本。结果中位数为：
+
+| 路径 | server time / 256 tok | TTFT | E2E TPS | decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| baseline：native front 关闭 | 19,973.851 ms | 247.285 ms | 12.81676 | 12.94438 |
+| candidate：native front 开启 | 15,936.131 ms | 561.398 ms | 16.06412 | 16.58565 |
+| candidate / baseline | 0.79785x latency | +314.113 ms | **1.25337x** | **1.28130x** |
+
+原始结果位于：
+
+```text
+/tmp/dsv4-flash-moefront-e2e-45a7cb7-25b82f-v3/results/
+/tmp/dsv4-flash-moefront-tps-45a7cb7-20260827/results/{baseline,mega}.perf.json
+/tmp/dsv4-flash-moefront-tps-45a7cb7-20260827/runner.log
+```
+
+两个 perf JSON 的 SHA256 分别为
+`2d831bfdec3892c188d867051deab4e4c0e76c457a39078062fec6396cdead57` 和
+`7b72ebb9f689d5831f75154910771c26775c5f06e336b47a388385d4cf367ba8`。
+
+这组数据证明 Flash learned-routing 的四-kernel front 已在完整 CSA+HCA+MegaMoE-SE EP4
+serving 中产生端到端收益，但样本仅为单 prompt、三次、eager decode。Pro/HashMoE、CUDA
+Graph serving、代表性 batch/context grid 和开关关闭回归仍是发布前剩余验证。

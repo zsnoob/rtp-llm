@@ -469,7 +469,7 @@ class MegaMoEFrontAdapter:
         self.runtime = runtime
         self.hc_fn = layer_weights[W.v4_hc_ffn_fn].contiguous()
         self.hc_base = layer_weights[W.v4_hc_ffn_base].contiguous()
-        self.hc_scale = layer_weights[W.v4_hc_ffn_scale].contiguous()
+        self.hc_scale = layer_weights[W.v4_hc_ffn_scale].reshape(-1).contiguous()
         self.ffn_norm_weight = layer_weights[W.v4_ffn_norm].contiguous()
         self.router_weight = gate._weight_bf16().contiguous()
         self.correction_bias = gate.bias

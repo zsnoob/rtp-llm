@@ -20,12 +20,15 @@ Environment:
     E2E_KERNEL_ROOT optional clean-wheel install root for extension overrides
     E2E_OUT     output dir for logs/results (default ./e2e_out)
     E2E_JIT_CACHE  base dir for the managed JIT caches (default ~/.cache/rtp_jit)
+    E2E_PERF    set to 1 for a controlled 64-token warmup + 3x256-token run
+    E2E_PERF_ONLY  skip functional queries and run only the controlled TPS case
 """
 
 import json
 import os
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -65,6 +68,15 @@ MOE_FRONT = os.environ.get("E2E_MOE_FRONT", "0") not in (
     "false",
     "False",
 )
+PERF = os.environ.get("E2E_PERF", "0") not in ("0", "", "false", "False")
+PERF_ONLY = os.environ.get("E2E_PERF_ONLY", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+if PERF_ONLY:
+    PERF = True
 if MOE_FRONT and EP_SIZE <= 1:
     sys.exit("E2E_MOE_FRONT=1 requires E2E_EP_SIZE > 1")
 OUT_DIR = Path(os.environ.get("E2E_OUT", "e2e_out"))
@@ -113,6 +125,14 @@ QUERIES = [
         "max_new_tokens": 200,
     },
 ]
+PERF_PROMPT = (
+    "Write a detailed step-by-step explanation of how paged attention works "
+    "in LLM inference engines. Include concrete implementation details and "
+    "examples."
+)
+PERF_WARMUP_TOKENS = 64
+PERF_SAMPLE_TOKENS = 256
+PERF_SAMPLES = 3
 
 
 def assert_port_unused() -> None:
@@ -209,33 +229,95 @@ def wait_ready(proc: subprocess.Popen, timeout: int = 5400) -> bool:
     return bool(ready and proc.poll() is None)
 
 
+def query(prompt: str, max_new_tokens: int) -> dict:
+    body = json.dumps(
+        {
+            "prompt": prompt,
+            "generate_config": {
+                "max_new_tokens": max_new_tokens,
+                "top_k": 1,
+                "top_p": 0,
+            },
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}/",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        return json.loads(resp.read())
+
+
 def query_all(tag: str) -> list:
     results = []
     for item in QUERIES:
-        body = json.dumps(
-            {
-                "prompt": item["prompt"],
-                "generate_config": {
-                    "max_new_tokens": item["max_new_tokens"],
-                    "top_k": 1,
-                    "top_p": 0,
-                },
-            }
-        ).encode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            payload = json.loads(resp.read())
+        payload = query(item["prompt"], item["max_new_tokens"])
         results.append(payload)
         text = payload.get("response", payload)
         print(
-            f"[{tag}] Q: {item['prompt'][:40]!r}\n[{tag}] A: " f"{str(text)[:160]!r}",
+            f"[{tag}] Q: {item['prompt'][:40]!r}\n[{tag}] A: "
+            f"{str(text)[:160]!r}",
             flush=True,
         )
     return results
+
+
+def performance_sample(payload: dict) -> dict:
+    aux = payload.get("aux_info")
+    if not isinstance(aux, dict):
+        raise RuntimeError("performance response is missing aux_info")
+    output_len = int(aux.get("output_len", 0))
+    cost_ms = float(aux.get("cost_time", 0.0))
+    first_token_ms = float(aux.get("first_token_cost_time", 0.0))
+    decode_ms = cost_ms - first_token_ms
+    if output_len < 2 or cost_ms <= 0.0 or decode_ms <= 0.0:
+        raise RuntimeError(
+            "invalid performance response: "
+            f"output_len={output_len}, cost_ms={cost_ms}, "
+            f"first_token_ms={first_token_ms}"
+        )
+    return {
+        "output_len": output_len,
+        "cost_ms": cost_ms,
+        "first_token_ms": first_token_ms,
+        "e2e_tps": output_len * 1000.0 / cost_ms,
+        "decode_tps": (output_len - 1) * 1000.0 / decode_ms,
+    }
+
+
+def query_performance(tag: str) -> dict:
+    query(PERF_PROMPT, PERF_WARMUP_TOKENS)
+    print(
+        f"[{tag}] performance warmup complete: {PERF_WARMUP_TOKENS} tokens",
+        flush=True,
+    )
+    samples = []
+    for index in range(PERF_SAMPLES):
+        payload = query(PERF_PROMPT, PERF_SAMPLE_TOKENS)
+        sample = performance_sample(payload)
+        samples.append(sample)
+        print(f"[{tag}] performance sample {index}: {sample}", flush=True)
+    summary = {
+        "prompt": PERF_PROMPT,
+        "warmup_tokens": PERF_WARMUP_TOKENS,
+        "sample_tokens": PERF_SAMPLE_TOKENS,
+        "sample_count": PERF_SAMPLES,
+        "samples": samples,
+        "median_cost_ms": statistics.median(x["cost_ms"] for x in samples),
+        "median_first_token_ms": statistics.median(
+            x["first_token_ms"] for x in samples
+        ),
+        "median_e2e_tps": statistics.median(x["e2e_tps"] for x in samples),
+        "median_decode_tps": statistics.median(
+            x["decode_tps"] for x in samples
+        ),
+    }
+    (OUT_DIR / f"{tag}.perf.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2)
+    )
+    print(f"[{tag}] performance median: {summary}", flush=True)
+    return summary
 
 
 def stop_server(proc: subprocess.Popen) -> None:
@@ -273,10 +355,13 @@ def run(tag: str, extra_env: dict) -> list:
                 f"{OUT_DIR / (tag + '.server.log')}"
             )
         print(f"[{tag}] server ready", flush=True)
-        results = query_all(tag)
-        (OUT_DIR / f"{tag}.results.json").write_text(
-            json.dumps(results, ensure_ascii=False, indent=2)
-        )
+        results = [] if PERF_ONLY else query_all(tag)
+        if not PERF_ONLY:
+            (OUT_DIR / f"{tag}.results.json").write_text(
+                json.dumps(results, ensure_ascii=False, indent=2)
+            )
+        if PERF:
+            query_performance(tag)
         return results
     finally:
         stop_server(proc)
@@ -325,7 +410,7 @@ def main() -> None:
             path = OUT_DIR / f"{tag}.results.json"
             if tag not in runs and path.exists():
                 runs[tag] = json.loads(path.read_text())
-    if len(runs) == 2:
+    if len(runs) == 2 and any(runs.values()):
         print("\n========== COMPARISON ==========", flush=True)
         mismatches = 0
         for index, (base, mega) in enumerate(zip(runs["baseline"], runs["mega"])):
@@ -340,6 +425,33 @@ def main() -> None:
         print(
             f"\n{len(runs['baseline']) - mismatches}/"
             f"{len(runs['baseline'])} queries identical"
+        )
+    perf_runs = {}
+    for tag in ("baseline", "mega"):
+        path = OUT_DIR / f"{tag}.perf.json"
+        if path.exists():
+            perf_runs[tag] = json.loads(path.read_text())
+    if len(perf_runs) == 2:
+        baseline = perf_runs["baseline"]
+        mega = perf_runs["mega"]
+        print("\n========== PERFORMANCE COMPARISON ==========", flush=True)
+        print(
+            json.dumps(
+                {
+                    "baseline": baseline,
+                    "mega": mega,
+                    "mega_over_baseline_e2e_tps": (
+                        mega["median_e2e_tps"] / baseline["median_e2e_tps"]
+                    ),
+                    "mega_over_baseline_decode_tps": (
+                        mega["median_decode_tps"]
+                        / baseline["median_decode_tps"]
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            flush=True,
         )
 
 

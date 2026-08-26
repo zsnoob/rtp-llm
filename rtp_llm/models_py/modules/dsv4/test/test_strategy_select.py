@@ -14,7 +14,10 @@ import unittest
 from contextlib import contextmanager
 from unittest import mock
 
+import torch
+
 # Importing strategies populates the registry via ``register_strategy``.
+from rtp_llm.models_py.modules.dsv4.moe import mega_se_buf
 from rtp_llm.models_py.modules.dsv4.moe.strategies import (
     DeepEPStrategy,
     GroupedFP4Strategy,
@@ -239,6 +242,112 @@ class StrategySelectTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 select_strategy(_cfg(ep_size=2), forced=forced, strict=strict)
         self.assertIn("Forced MoE strategy 'mega_se'", str(cm.exception))
+
+    def test_official_deepgemm_mega_se_signature_is_accepted(self):
+        def fp8_fp4_mega_moe(
+            y,
+            l1_weights,
+            l2_weights,
+            sym_buffer,
+            shared_l1_weights=None,
+            shared_l2_weights=None,
+            cumulative_local_expert_recv_stats=None,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=None,
+            fast_math=True,
+        ):
+            pass
+
+        def get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            num_shared_experts=0,
+            use_fp8_dispatch=True,
+            mma_type="fp8xfp4",
+            activation="swiglu",
+        ):
+            pass
+
+        fake_deep_gemm = types.SimpleNamespace(
+            fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+            get_symm_buffer_for_mega_moe=get_symm_buffer_for_mega_moe,
+            get_block_m_for_mega_moe=object(),
+            transform_weights_for_mega_moe=object(),
+            transform_sf_into_required_layout=object(),
+        )
+        with _env(DSV4_USE_MEGA_MOE="1"), mock.patch.object(
+            mega_se_buf, "_mega_moe_unavailable_reason", return_value=None
+        ), mock.patch.dict(sys.modules, {"deep_gemm": fake_deep_gemm}):
+            self.assertIsNone(mega_se_buf._mega_moe_se_unavailable_reason())
+
+    def test_mega_moe_se_launch_matches_official_api(self):
+        calls = []
+
+        fake_deep_gemm = types.SimpleNamespace(
+            fp8_fp4_mega_moe=lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+        strategy = object.__new__(MegaMoEStrategySE)
+        strategy.cfg = types.SimpleNamespace(layer_id=2, swiglu_limit=10.0)
+        strategy._mega_l1_w = "routed_l1_w"
+        strategy._mega_l1_sf = "routed_l1_sf"
+        strategy._mega_l2_w = "routed_l2_w"
+        strategy._mega_l2_sf = "routed_l2_sf"
+        strategy._se_l1_w = "shared_l1_w"
+        strategy._se_l1_sf = "shared_l1_sf"
+        strategy._se_l2_w = "shared_l2_w"
+        strategy._se_l2_sf = "shared_l2_sf"
+        strategy._mega_buf = "symm_buffer"
+
+        with mock.patch.dict(sys.modules, {"deep_gemm": fake_deep_gemm}), mock.patch.object(
+            strategy, "_maybe_pre_kernel_barrier"
+        ), mock.patch(
+            "rtp_llm.models_py.modules.dsv4.moe.strategies.mega_se."
+            "sync_cuda_graph_warmup_ranks"
+        ):
+            strategy._launch("output", 4, "cuda:0")
+
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(args[0], "output")
+        self.assertEqual(kwargs["shared_l1_weights"], ("shared_l1_w", "shared_l1_sf"))
+        self.assertEqual(kwargs["shared_l2_weights"], ("shared_l2_w", "shared_l2_sf"))
+        self.assertNotIn("shared_recipe", kwargs)
+
+    def test_mega_moe_se_expands_checkpoint_scale_without_requantizing(self):
+        transformed = []
+
+        fake_deep_gemm = types.SimpleNamespace(
+            transform_sf_into_required_layout=lambda *args, **kwargs: transformed.append(
+                (args, kwargs)
+            )
+            or "packed_scale"
+        )
+        scale = torch.tensor(
+            [[1.0, 2.0], [4.0, 8.0]], dtype=torch.float8_e8m0fnu
+        )
+
+        result = MegaMoEStrategySE._shared_expert_sf_to_int(
+            fake_deep_gemm, scale, 256, 256
+        )
+
+        self.assertEqual(result, "packed_scale")
+        self.assertEqual(len(transformed), 1)
+        args, kwargs = transformed[0]
+        expanded, mn, k, recipe = args
+        self.assertEqual((mn, k, recipe), (256, 256, (1, 32)))
+        self.assertEqual(kwargs, {"num_groups": None})
+        self.assertEqual(tuple(expanded.shape), (256, 8))
+        torch.testing.assert_close(
+            expanded[0], torch.tensor([1.0] * 4 + [2.0] * 4)
+        )
+        torch.testing.assert_close(
+            expanded[128], torch.tensor([4.0] * 4 + [8.0] * 4)
+        )
 
     def test_mega_moe_se_and_old_fused_conflict(self):
         with _env(

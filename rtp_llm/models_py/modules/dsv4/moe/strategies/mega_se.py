@@ -44,7 +44,7 @@ _MEGA_MOE_SE_JIT_WARMED_KEYS: set[tuple] = set()
 _MEGA_SE_GATE_PACK_KERNELS = None
 _MEGA_SE_GATE_PACK_KERNELS_UNAVAILABLE = False
 _ROUTED_RECIPE = (1, 1, FP4_BLOCK)
-_SHARED_RECIPE = (1, 128, 128)
+_SHARED_CHECKPOINT_SCALE_BLOCK = (128, 128)
 _MMA_TYPE = "fp8xfp4"
 
 
@@ -219,8 +219,23 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             raise TypeError(
                 "MegaMoE-SE expected shared UE8M0 scale, " f"got {scale.dtype}"
             )
+        block_mn, block_k = _SHARED_CHECKPOINT_SCALE_BLOCK
+        expected_shape = ((mn + block_mn - 1) // block_mn, (k + block_k - 1) // block_k)
+        if tuple(scale.shape) != expected_shape:
+            raise RuntimeError(
+                "MegaMoE-SE shared scale shape mismatch: "
+                f"got {tuple(scale.shape)}, expected {expected_shape} for weight {(mn, k)}"
+            )
+
+        # The checkpoint scale is one UE8M0 value per 128x128 weight block,
+        # while official MegaMoE consumes one packed value per row and 32 K
+        # elements. Repeating the same power-of-two scale preserves the FP8
+        # weight bits exactly; dequantising and requantising would add error.
+        expanded = scale.float().repeat_interleave(block_mn, dim=-2)
+        expanded = expanded.repeat_interleave(block_k // FP4_BLOCK, dim=-1)
+        expanded = expanded[:mn, : (k + FP4_BLOCK - 1) // FP4_BLOCK]
         return deep_gemm.transform_sf_into_required_layout(
-            scale.float(), mn, k, _SHARED_RECIPE[1:], num_groups=None
+            expanded, mn, k, (1, FP4_BLOCK), num_groups=None
         )
 
     def _block_m(self, tokens: int) -> int:
@@ -280,7 +295,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             int(cfg.max_tokens_per_rank),
             cfg.swiglu_limit,
             num_sms,
-            _SHARED_RECIPE,
+            _SHARED_CHECKPOINT_SCALE_BLOCK,
             tuple(token_counts),
             bool(getattr(self, "_gate_pack_warmup_enabled", False)),
             (
@@ -297,7 +312,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             logging.info(
                 "[DSV4 MegaMoE-SE] JIT warmup start: layer=%d tokens=[%s] "
                 "max_tokens_per_rank=%d ep=%d experts=%d topk=%d hidden=%d "
-                "intermediate=%d num_sms=%d shared_recipe=%s",
+                "intermediate=%d num_sms=%d shared_scale_block=%s",
                 cfg.layer_id,
                 format_token_counts(token_counts),
                 cfg.max_tokens_per_rank,
@@ -307,7 +322,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
                 cfg.dim,
                 cfg.moe_inter_dim,
                 num_sms,
-                _SHARED_RECIPE,
+                _SHARED_CHECKPOINT_SCALE_BLOCK,
             )
         tmpdir, previous_tmpdir = _activate_mega_moe_rank_nvcc_tmpdir(rank)
         try:
@@ -448,7 +463,6 @@ class MegaMoEStrategySE(MegaMoEStrategy):
                 self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None
             ),
             fast_math=True,
-            shared_recipe=_SHARED_RECIPE,
         )
 
     def forward(self, x, weights, indices):

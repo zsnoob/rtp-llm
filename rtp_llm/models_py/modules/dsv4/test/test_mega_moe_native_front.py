@@ -270,7 +270,9 @@ def _block_and_weights(*, is_hash: bool, geometry=PRO_MOE_FRONT_GEOMETRY):
         W.v4_hc_ffn_base: torch.empty(
             (geometry.hc_width,), dtype=torch.float32
         ),
-        W.v4_hc_ffn_scale: torch.empty((3,), dtype=torch.float32),
+        # Flash checkpoints retain this singleton dimension. The adapter
+        # normalizes the native ABI's contiguous-numel-3 contract to [3].
+        W.v4_hc_ffn_scale: torch.empty((3, 1), dtype=torch.float32),
         W.v4_ffn_norm: torch.empty((geometry.hidden,), dtype=torch.bfloat16),
     }
     return block, weights
@@ -433,6 +435,7 @@ class MegaMoEFrontAdapterTest(unittest.TestCase):
         geometry = FLASH_MOE_FRONT_GEOMETRY
         ops, block, _ = self._run(is_hash=False, geometry=geometry)
         call = ops.learned_calls[0]
+        self.assertEqual(tuple(call["hc_scale"].shape), (3,))
         self.assertEqual(
             tuple(call["collapsed"].shape), (geometry.max_m, geometry.hidden)
         )

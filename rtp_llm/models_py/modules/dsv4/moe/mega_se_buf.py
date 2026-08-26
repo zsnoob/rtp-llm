@@ -202,7 +202,7 @@ def _mega_moe_se_unavailable_reason() -> str | None:
 
         reason = _signature_has(
             deep_gemm.fp8_fp4_mega_moe,
-            ("shared_l1_weights", "shared_l2_weights", "shared_recipe"),
+            ("shared_l1_weights", "shared_l2_weights"),
         )
         if reason is not None:
             return reason
