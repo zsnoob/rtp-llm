@@ -22,6 +22,7 @@ Environment:
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -111,7 +112,19 @@ QUERIES = [
 ]
 
 
+def assert_port_unused() -> None:
+    """Reject stale servers before a new comparison leg is launched."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        if probe.connect_ex(("127.0.0.1", PORT)) == 0:
+            raise RuntimeError(
+                f"port {PORT} is already accepting connections; stop the "
+                "stale server or choose a different E2E_PORT"
+            )
+
+
 def start_server(tag: str, extra_env: dict) -> subprocess.Popen:
+    assert_port_unused()
     env = os.environ.copy()
     # The WebIDE image may export a PYTHONPATH for an older RTP checkout.  A
     # mixed source/native ABI makes ``rtp_llm.ops`` discover that old
@@ -180,7 +193,8 @@ def wait_ready(proc: subprocess.Popen, timeout: int = 5400) -> bool:
         )
     from rtp_llm.utils.util import wait_sever_done
 
-    return wait_sever_done(proc, PORT, timeout)
+    ready = wait_sever_done(proc, PORT, timeout)
+    return bool(ready and proc.poll() is None)
 
 
 def query_all(tag: str) -> list:
