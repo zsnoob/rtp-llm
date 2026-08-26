@@ -75,9 +75,11 @@ source fingerprint 为
 
 本机已完成源码 fingerprint、脚本语法、Python compileall、文档 diff 和历史四-kernel
 artifact 校验；四卡 WebIDE 已完成 CUDA13/SM103 wheel 构建、安装和 EP4 适配层测试。
-当前 release gate 只剩真实权重上的 EP4 MoE block 数值回归、CSA+HCA+MoE front 完整
-token 生成和对应 TPS/Perfetto；目标 checkpoint 目前为空，不能把组件级或算子级结果
-记为完整端到端通过。
+当前 release gate 只剩 **DSV4-Pro** 真实权重上的 EP4 MoE block 数值回归、
+CSA+HCA+四-kernel MoE front 完整 token 生成和对应 TPS/Perfetto。目标机已经找到并完成
+DSV4-Flash 全量 checkpoint 的 EP4 生成与 TPS 对照，但 Flash 的 `D=4096/E=256` 不满足
+native front 固定的 Pro `D=7168/E=384` ABI，不能把 Flash 结果记成四-kernel front
+端到端通过。
 
 ## 2. 支持边界
 
@@ -813,7 +815,7 @@ geometry: hidden=7168, hc_mult=4, hc_width=24, experts=384, topk=6,
 `geometry_moe_front()` / `build_info_moe_front()` 返回上述合约。生产运行必须安装
 完整 wheel，不能使用 `DSV4_MEGA_ONLY=1` 过滤掉普通 `rtp_ops`。
 
-E2E runner `docs/dsv4_mega_e2e/run_e2e_compare.py` 本轮补齐了四个可复现性要求：
+E2E runner `docs/dsv4_mega_e2e/run_e2e_compare.py` 本轮补齐了五个可复现性要求：
 
 * `E2E_TP_SIZE`、`E2E_DP_SIZE` 可配置，四卡 EP 使用 `TP=1, DP=4, EP=4`；
 * child 和 health-check parent 都固定到 `E2E_SOURCE_ROOT`，清除旧 venv 的
@@ -821,6 +823,8 @@ E2E runner `docs/dsv4_mega_e2e/run_e2e_compare.py` 本轮补齐了四个可复�
 * JIT cache、`watchdog` 等 serving 依赖由运行环境显式准备。
 * 启动前检查 `E2E_CKPT` 是 populated snapshot 且含 `config.json`，避免空缓存目录
   触发长时间 server 启动后才在 tokenizer 阶段失败。
+* 每一轮启动前拒绝已在监听的 `E2E_PORT`，health check 返回后还会确认本轮 child
+  仍然存活，避免误连残留 server 产生假通过。
 
 远端 staged checkout 在首次适配层收集时暴露了
 `dsv4/transformer.py` 缺少 `typing.Tuple` 导入的问题；已补齐并重新同步。匹配
@@ -858,16 +862,47 @@ snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
 256 词表的缩小 fixture（约 256--692 MiB），只能用于单卡 smoke，不能替代 EP4/384-expert
 生产 checkpoint。此前 fixture 的 DeepGEMM startup JIT 结果不计入生产性能结论。
 
-```bash
-E2E_CKPT=/tmp/DeepSeek-V4-Flash-0731 \
-E2E_GPU=0,1,2,3 E2E_TP_SIZE=1 E2E_DP_SIZE=4 \
-E2E_EP_SIZE=4 E2E_WORLD_SIZE=4 E2E_LOCAL_WORLD_SIZE=4 \
-E2E_MOE_FRONT=1 python docs/dsv4_mega_e2e/run_e2e_compare.py
+该 Flash checkpoint 的实际配置是 `hidden_size=4096`、`n_routed_experts=256`、
+`num_experts_per_tok=6`、`hc_mult=4`。因此对它设置 `E2E_MOE_FRONT=1` 会按设计在模型
+初始化阶段失败，并明确报告只支持 Pro `D=7168/E=384/TopK=6/hc=4`；不能删除 guard
+后强行运行，因为 wheel 的 `geometry_moe_front()`、workspace 和四个 kernel 都使用该
+固定 ABI。
+
+### 8.6 2026-08-26 全量 Flash EP4 token/TPS 实测
+
+完整 checkpoint `/tmp/DeepSeek-V4-Flash-0731` 已在四张 PyTorch capability `(10,3)`
+设备上以 `TP=1, DP=4, EP=4, world_size=4` 跑通。运行 venv 最初缺少仓库 lock 中的
+`nvidia-cutlass-dsl==4.4.1`，导致 CUDA Linear strategy 注册被 `No module named
+'cutlass'` 中断；补齐锁定依赖并实际验证 `import cutlass` 后，四 rank 均完成 48 分片
+加载和 DeepGEMM/TileLang/Triton 预热。baseline 与 Mega 两轮日志都确认分配了
+MegaMoE symmetric buffer：`group_size=4, experts=256, topk=6, hidden=4096`。
+
+token 对照使用三条相同 greedy 请求。baseline 关闭 CSA/HCA，Mega 打开 CSA/HCA；
+两轮均保持 `DSV4_USE_MEGA_MOE=1`，并因 Flash 几何保持 native front/SE 关闭。结果为
+`1/3` 完整字符串一致：短算术请求一致，另外两条在相同前缀后发生 greedy 分岔。
+
+TPS 使用固定同一 prompt、concurrency 1、关闭 CUDA Graph；每轮服务就绪后先生成 64
+tokens warmup，再连续三次生成 256 tokens。启动、权重加载、JIT 和进程清理均不计入
+样本。`E2E TPS = output_len / cost_time`；decode TPS 使用
+`(output_len - 1) / (cost_time - first_token_cost_time)`。表中为三次中位数：
+
+| 路径 | server time / 256 tok | TTFT | E2E TPS | decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| baseline：CSA=0, HCA=0, MegaMoE=1 | 37,214.946 ms | 324.885 ms | 6.87896 | 6.91243 |
+| Mega：CSA=1, HCA=1, MegaMoE=1 | 21,878.822 ms | 325.628 ms | 11.70081 | 11.83119 |
+| Mega / baseline | 0.5879x latency | +0.743 ms | **1.70096x** | **1.71158x** |
+
+三次 E2E TPS 原始值分别为 baseline
+`[6.79537, 6.87896, 7.10462]`、Mega
+`[11.63129, 11.70081, 12.17898]`。远端原始 JSON 与日志为：
+
+```text
+/tmp/dsv4-full-ep4-e2e-20260826-v2/flash-tps-summary.json
+/tmp/dsv4-full-ep4-e2e-20260826-v2/{baseline,mega}-tps.json
+/tmp/dsv4-full-ep4-e2e-20260826-flash-tps.log
 ```
 
-该命令会先跑关闭 Mega 开关的 baseline，再跑同时打开 CSA、HCA 和四-kernel
-MoE-front 的 mega 轮，并对固定 greedy queries 做 token 级比较。当前已获得的性能
-结论仍限于算子层 cold-L2 CUDA Graph envelope：四-kernel MoE-front 的既有结果为
-`25.536 us` median，相对旧 RTP 六-kernel 路径 `32.2405 us`，约 `1.2626x`；使用完整
-`/tmp` checkpoint 的 EP4 token/TPS/Perfetto 测试待启动命令稳定执行后补录，不能用
-fixture 结果替代。
+这组 `1.70x` 是 **Flash CSA+HCA** 在相同 MegaMoE workload 上的端到端 decode 收益，
+不包含四-kernel native MoE front。四-kernel front 当前有效证据仍是算子层 cold-L2
+CUDA Graph envelope：`25.536 us` median，相对旧 RTP 六-kernel `32.2405 us` 为
+`1.2626x`；其 Pro EP4 token/TPS/Perfetto 仍需 `D=7168/E=384` 全量权重验证。
