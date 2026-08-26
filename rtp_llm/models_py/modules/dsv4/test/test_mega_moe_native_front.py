@@ -8,6 +8,7 @@ import torch
 
 from rtp_llm.models_py.modules.dsv4.block import Block
 from rtp_llm.models_py.modules.dsv4.moe.native_front import (
+    FLASH_MOE_FRONT_GEOMETRY,
     MOE_FRONT_EXPERTS,
     MOE_FRONT_HC_MULT,
     MOE_FRONT_HC_WIDTH,
@@ -16,6 +17,7 @@ from rtp_llm.models_py.modules.dsv4.moe.native_front import (
     MOE_FRONT_MAX_M,
     MOE_FRONT_SCALE_COLS,
     MOE_FRONT_TOPK,
+    PRO_MOE_FRONT_GEOMETRY,
     MegaMoEFrontAdapter,
     MegaMoEFrontRuntime,
 )
@@ -23,17 +25,17 @@ from rtp_llm.models_py.modules.dsv4.transformer import V4Transformer
 from rtp_llm.utils.model_weight import W
 
 
-def _geometry(**overrides):
+def _geometry(spec=PRO_MOE_FRONT_GEOMETRY, **overrides):
     geometry = {
         "abi_version": 1,
         "kernel_contract_version": MOE_FRONT_KERNEL_CONTRACT_VERSION,
-        "hidden": MOE_FRONT_HIDDEN,
-        "hc_mult": MOE_FRONT_HC_MULT,
-        "hc_width": MOE_FRONT_HC_WIDTH,
-        "experts": MOE_FRONT_EXPERTS,
-        "topk": MOE_FRONT_TOPK,
-        "max_m": MOE_FRONT_MAX_M,
-        "scale_cols": MOE_FRONT_SCALE_COLS,
+        "hidden": spec.hidden,
+        "hc_mult": spec.hc_mult,
+        "hc_width": spec.hc_width,
+        "experts": spec.experts,
+        "topk": spec.topk,
+        "max_m": spec.max_m,
+        "scale_cols": spec.scale_cols,
         "collapse_ssq_bits": 32,
     }
     geometry.update(overrides)
@@ -167,7 +169,7 @@ class _FakeOps:
 
         self.Dsv4MoeFrontPlan = Dsv4MoeFrontPlan
 
-    def geometry_moe_front(self):
+    def geometry_moe_front(self, hidden=MOE_FRONT_HIDDEN):
         return self.geometry
 
     def build_info_moe_front(self):
@@ -180,52 +182,53 @@ class _FakeOps:
         }
 
 
-def _buffer(rows=MOE_FRONT_MAX_M):
-    shared_rows = max(rows, MOE_FRONT_MAX_M)
+def _buffer(rows=MOE_FRONT_MAX_M, geometry=PRO_MOE_FRONT_GEOMETRY):
+    shared_rows = max(rows, geometry.max_m)
     return SimpleNamespace(
         x=torch.empty(
-            (rows, MOE_FRONT_HIDDEN), dtype=torch.float8_e4m3fn
+            (rows, geometry.hidden), dtype=torch.float8_e4m3fn
         ),
-        x_sf=torch.empty((rows, MOE_FRONT_SCALE_COLS), dtype=torch.int32),
+        x_sf=torch.empty((rows, geometry.scale_cols), dtype=torch.int32),
         shared_l1_acts_sf=torch.empty_strided(
-            (shared_rows, MOE_FRONT_SCALE_COLS),
+            (shared_rows, geometry.scale_cols),
             (1, shared_rows),
             dtype=torch.int32,
         ),
-        topk_idx=torch.empty((rows, MOE_FRONT_TOPK), dtype=torch.int64),
+        topk_idx=torch.empty((rows, geometry.topk), dtype=torch.int64),
         topk_weights=torch.empty(
-            (rows, MOE_FRONT_TOPK), dtype=torch.float32
+            (rows, geometry.topk), dtype=torch.float32
         ),
     )
 
 
 class _FakeGate:
-    def __init__(self, *, is_hash: bool) -> None:
+    def __init__(self, *, is_hash: bool, geometry=PRO_MOE_FRONT_GEOMETRY) -> None:
         self.hash = is_hash
         self.score_func = "sqrtsoftplus"
         self.route_scale = 2.5
         self.weight = torch.empty(
-            (MOE_FRONT_EXPERTS, MOE_FRONT_HIDDEN), dtype=torch.bfloat16
+            (geometry.experts, geometry.hidden), dtype=torch.bfloat16
         )
         self.bias = (
             None
             if is_hash
-            else torch.empty((MOE_FRONT_EXPERTS,), dtype=torch.float32)
+            else torch.empty((geometry.experts,), dtype=torch.float32)
         )
         if is_hash:
-            self.tid2eid = torch.zeros((32, MOE_FRONT_TOPK), dtype=torch.int64)
+            self.tid2eid = torch.zeros((32, geometry.topk), dtype=torch.int64)
 
     def _weight_bf16(self):
         return self.weight
 
 
 class _FakeFfn:
-    def __init__(self, *, is_hash: bool) -> None:
-        self.dim = MOE_FRONT_HIDDEN
-        self.n_routed_experts = MOE_FRONT_EXPERTS
-        self.n_activated_experts = MOE_FRONT_TOPK
-        self.gate = _FakeGate(is_hash=is_hash)
-        self.buffer = _buffer(rows=MOE_FRONT_MAX_M + 64)
+    def __init__(self, *, is_hash: bool, geometry=PRO_MOE_FRONT_GEOMETRY) -> None:
+        self.dim = geometry.hidden
+        self.n_routed_experts = geometry.experts
+        self.n_activated_experts = geometry.topk
+        self.gate = _FakeGate(is_hash=is_hash, geometry=geometry)
+        self.buffer = _buffer(rows=geometry.max_m + 64, geometry=geometry)
+        self.geometry = geometry
         self.prepacked_calls = []
 
     def can_use_native_front(self):
@@ -239,7 +242,7 @@ class _FakeFfn:
 
     def forward_prepacked(self, tokens, device):
         self.prepacked_calls.append((tokens, device))
-        return torch.zeros((tokens, MOE_FRONT_HIDDEN), dtype=torch.bfloat16)
+        return torch.zeros((tokens, self.geometry.hidden), dtype=torch.bfloat16)
 
 
 class _FakeHc:
@@ -255,25 +258,55 @@ class _FakeHc:
         return residual + 1
 
 
-def _block_and_weights(*, is_hash: bool):
-    ffn = _FakeFfn(is_hash=is_hash)
+def _block_and_weights(*, is_hash: bool, geometry=PRO_MOE_FRONT_GEOMETRY):
+    ffn = _FakeFfn(is_hash=is_hash, geometry=geometry)
     hc = _FakeHc()
     block = SimpleNamespace(layer_id=3, ffn=ffn, ffn_hc=hc)
     weights = {
         W.v4_hc_ffn_fn: torch.empty(
-            (MOE_FRONT_HC_WIDTH, MOE_FRONT_HC_MULT * MOE_FRONT_HIDDEN),
+            (geometry.hc_width, geometry.hc_mult * geometry.hidden),
             dtype=torch.float32,
         ),
         W.v4_hc_ffn_base: torch.empty(
-            (MOE_FRONT_HC_WIDTH,), dtype=torch.float32
+            (geometry.hc_width,), dtype=torch.float32
         ),
         W.v4_hc_ffn_scale: torch.empty((3,), dtype=torch.float32),
-        W.v4_ffn_norm: torch.empty((MOE_FRONT_HIDDEN,), dtype=torch.bfloat16),
+        W.v4_ffn_norm: torch.empty((geometry.hidden,), dtype=torch.bfloat16),
     }
     return block, weights
 
 
 class MegaMoEFrontRuntimeTest(unittest.TestCase):
+    def test_accepts_flash_contract_geometry(self) -> None:
+        ops = _FakeOps(_geometry(FLASH_MOE_FRONT_GEOMETRY))
+        runtime = MegaMoEFrontRuntime(ops_module=ops)
+        self.assertIs(
+            runtime.require_ops(torch.device("cpu"), FLASH_MOE_FRONT_GEOMETRY),
+            ops,
+        )
+
+    def test_validates_each_geometry_once_on_a_shared_runtime(self) -> None:
+        ops = _FakeOps(_geometry(PRO_MOE_FRONT_GEOMETRY))
+        geometries = {
+            spec.hidden: _geometry(spec)
+            for spec in (PRO_MOE_FRONT_GEOMETRY, FLASH_MOE_FRONT_GEOMETRY)
+        }
+        calls = []
+
+        def geometry_moe_front(hidden):
+            calls.append(hidden)
+            return geometries[hidden]
+
+        ops.geometry_moe_front = geometry_moe_front
+        runtime = MegaMoEFrontRuntime(ops_module=ops)
+        runtime.require_ops(torch.device("cpu"), PRO_MOE_FRONT_GEOMETRY)
+        runtime.require_ops(torch.device("cpu"), FLASH_MOE_FRONT_GEOMETRY)
+        runtime.require_ops(torch.device("cpu"), FLASH_MOE_FRONT_GEOMETRY)
+        self.assertEqual(
+            calls,
+            [PRO_MOE_FRONT_GEOMETRY.hidden, FLASH_MOE_FRONT_GEOMETRY.hidden],
+        )
+
     def test_rejects_geometry_with_non_fp32_collapse_ssq(self) -> None:
         runtime = MegaMoEFrontRuntime(
             ops_module=_FakeOps(_geometry(collapse_ssq_bits=16))
@@ -365,17 +398,17 @@ class MegaMoEFrontAdapterTest(unittest.TestCase):
         )
         self.assertFalse(adapter.supports_decode_shape(hidden))
 
-    def _run(self, *, is_hash: bool):
-        ops = _FakeOps()
+    def _run(self, *, is_hash: bool, geometry=PRO_MOE_FRONT_GEOMETRY):
+        ops = _FakeOps(_geometry(geometry))
         runtime = MegaMoEFrontRuntime(ops_module=ops)
-        block, weights = _block_and_weights(is_hash=is_hash)
+        block, weights = _block_and_weights(is_hash=is_hash, geometry=geometry)
         adapter = MegaMoEFrontAdapter(block, weights, runtime)
         hidden_storage = torch.zeros(
-            (MOE_FRONT_MAX_M, 1, MOE_FRONT_HC_MULT, MOE_FRONT_HIDDEN),
+            (geometry.max_m, 1, geometry.hc_mult, geometry.hidden),
             dtype=torch.bfloat16,
         )
         hidden = hidden_storage[:7]
-        input_ids_storage = torch.arange(MOE_FRONT_MAX_M, dtype=torch.int64)
+        input_ids_storage = torch.arange(geometry.max_m, dtype=torch.int64)
         input_ids = input_ids_storage[:7].view(7, 1)
 
         first = adapter.forward_ffn_sublayer(block, hidden, input_ids)
@@ -387,7 +420,7 @@ class MegaMoEFrontAdapterTest(unittest.TestCase):
         self.assertEqual(len(ops.plan_calls), 1)
         self.assertEqual(
             tuple(ops.plan_calls[0].hidden_states.shape),
-            (MOE_FRONT_MAX_M, MOE_FRONT_HC_MULT, MOE_FRONT_HIDDEN),
+            (geometry.max_m, geometry.hc_mult, geometry.hidden),
         )
         self.assertEqual(
             ops.plan_calls[0].hidden_states.data_ptr(), hidden.data_ptr()
@@ -395,6 +428,22 @@ class MegaMoEFrontAdapterTest(unittest.TestCase):
         self.assertEqual(block.ffn.prepacked_calls, [(7, hidden.device)] * 2)
         self.assertEqual(len(block.ffn_hc.post_calls), 2)
         return ops, block, input_ids_storage
+
+    def test_flash_front_uses_flash_workspace_and_publication_shapes(self) -> None:
+        geometry = FLASH_MOE_FRONT_GEOMETRY
+        ops, block, _ = self._run(is_hash=False, geometry=geometry)
+        call = ops.learned_calls[0]
+        self.assertEqual(
+            tuple(call["collapsed"].shape), (geometry.max_m, geometry.hidden)
+        )
+        self.assertEqual(
+            tuple(call["router_logits"].shape),
+            (geometry.max_m, geometry.experts),
+        )
+        self.assertEqual(
+            tuple(call["x_sf"].shape), (geometry.max_m, geometry.scale_cols)
+        )
+        self.assertEqual(call["x_fp8"].data_ptr(), block.ffn.buffer.x.data_ptr())
 
     def test_learned_front_reuses_context_and_publishes_directly(self) -> None:
         ops, block, _ = self._run(is_hash=False)

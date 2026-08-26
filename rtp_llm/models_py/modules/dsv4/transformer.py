@@ -187,24 +187,29 @@ class V4Transformer(nn.Module):
             "false",
             "False",
         )
-        pro_front_geometry = (
-            int(args.dim) == 7168
-            and int(args.n_routed_experts) == 384
+        supported_front_geometry = (
+            (int(args.dim), int(args.n_routed_experts))
+            in ((7168, 384), (4096, 256))
             and int(args.n_activated_experts) == 6
             and int(args.hc_mult) == 4
             and int(args.tp_size) == 1
             and int(args.ep_size) > 1
         )
-        if enable_moe_front and not args.is_speculative and not pro_front_geometry:
+        if (
+            enable_moe_front
+            and not args.is_speculative
+            and not supported_front_geometry
+        ):
             raise RuntimeError(
                 "DSV4_MEGA_MOE_FRONT requires the production MegaMoE-SE "
-                "geometry: dim=7168, routed_experts=384, topk=6, hc_mult=4, "
-                "TP=1, EP>1"
+                "geometry: (dim=7168, routed_experts=384) or "
+                "(dim=4096, routed_experts=256), topk=6, hc_mult=4, TP=1, "
+                "EP>1"
             )
         if (
             enable_moe_front
             and not args.is_speculative
-            and pro_front_geometry
+            and supported_front_geometry
             and os.environ.get("DSV4_USE_MEGA_MOE_SE", "0") != "1"
         ):
             raise RuntimeError(
@@ -252,7 +257,11 @@ class V4Transformer(nn.Module):
                     layer.enable_mega_csa(self._mega_csa_runtime, mw.weights[layer_id])
                 if mega_flags["DSV4_MEGA_HCA"]:
                     layer.enable_mega_hca(self._mega_csa_runtime, mw.weights[layer_id])
-        if enable_moe_front and not args.is_speculative and pro_front_geometry:
+        if (
+            enable_moe_front
+            and not args.is_speculative
+            and supported_front_geometry
+        ):
             from rtp_llm.models_py.modules.dsv4.moe.native_front import (
                 MOE_FRONT_MAX_M,
                 MegaMoEFrontRuntime,

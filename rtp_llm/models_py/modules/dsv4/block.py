@@ -187,7 +187,7 @@ class Block(nn.Module):
     def enable_mega_moe_front(
         self, runtime, layer_weights: Dict[str, torch.Tensor]
     ) -> None:
-        """Attach the Pro decode four-kernel FFN front."""
+        """Attach the Pro/Flash decode four-kernel FFN front."""
         from rtp_llm.models_py.modules.dsv4.moe.native_front import (
             MegaMoEFrontAdapter,
         )

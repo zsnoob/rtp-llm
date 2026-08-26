@@ -1,4 +1,4 @@
-"""Production adapter for the DeepSeek-V4 Pro four-kernel MoE front.
+"""Production adapter for the DeepSeek-V4 four-kernel MoE front.
 
 The CUDA implementation is supplied by a matching ``rtp-kernel.dsv4_mega``
 build. This module owns model/runtime policy only: ABI validation, stable
@@ -19,14 +19,40 @@ from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
 
 
 MOE_FRONT_ABI_VERSION = 1
-MOE_FRONT_KERNEL_CONTRACT_VERSION = 1
-MOE_FRONT_HIDDEN = 7168
+MOE_FRONT_KERNEL_CONTRACT_VERSION = 2
 MOE_FRONT_HC_MULT = 4
 MOE_FRONT_HC_WIDTH = 24
-MOE_FRONT_EXPERTS = 384
 MOE_FRONT_TOPK = 6
 MOE_FRONT_MAX_M = 128
-MOE_FRONT_SCALE_COLS = MOE_FRONT_HIDDEN // 128
+
+
+@dataclass(frozen=True)
+class MoeFrontGeometry:
+    hidden: int
+    experts: int
+    scale_cols: int
+    hc_mult: int = MOE_FRONT_HC_MULT
+    hc_width: int = MOE_FRONT_HC_WIDTH
+    topk: int = MOE_FRONT_TOPK
+    max_m: int = MOE_FRONT_MAX_M
+
+
+PRO_MOE_FRONT_GEOMETRY = MoeFrontGeometry(
+    hidden=7168, experts=384, scale_cols=56
+)
+FLASH_MOE_FRONT_GEOMETRY = MoeFrontGeometry(
+    hidden=4096, experts=256, scale_cols=32
+)
+MOE_FRONT_GEOMETRIES = {
+    geometry.hidden: geometry
+    for geometry in (PRO_MOE_FRONT_GEOMETRY, FLASH_MOE_FRONT_GEOMETRY)
+}
+
+# Backward-compatible Pro aliases for callers that only need the established
+# default geometry. Production adapter dimensions come from ``self.geometry``.
+MOE_FRONT_HIDDEN = PRO_MOE_FRONT_GEOMETRY.hidden
+MOE_FRONT_EXPERTS = PRO_MOE_FRONT_GEOMETRY.experts
+MOE_FRONT_SCALE_COLS = PRO_MOE_FRONT_GEOMETRY.scale_cols
 
 
 @dataclass
@@ -53,11 +79,12 @@ class MegaMoEFrontRuntime:
     def __init__(self, *, ops_module: Any | None = None) -> None:
         self._ops = ops_module
         self._injected_ops = ops_module is not None
-        self._runtime_checked = False
-        self._workspaces: Dict[Tuple[str, int, int], MegaMoEFrontWorkspace] = {}
-        self._workspace_owners: Dict[Tuple[str, int, int], Any] = {}
+        self._runtime_checked: set[int] = set()
+        self._ops_abi_checked = False
+        self._workspaces: Dict[Tuple[str, int, int, int], MegaMoEFrontWorkspace] = {}
+        self._workspace_owners: Dict[Tuple[str, int, int, int], Any] = {}
         self._plans: Dict[int, Dict[tuple, _FrontPlanEntry]] = {}
-        self._validated_buffers: Dict[int, Any] = {}
+        self._validated_buffers: Dict[int, Tuple[Any, int]] = {}
 
     @property
     def allows_cpu_for_test(self) -> bool:
@@ -67,8 +94,12 @@ class MegaMoEFrontRuntime:
     def _capturing(device: torch.device) -> bool:
         return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
 
-    def require_ops(self, device: torch.device) -> Any:
-        if self._runtime_checked:
+    def require_ops(
+        self,
+        device: torch.device,
+        geometry: MoeFrontGeometry = PRO_MOE_FRONT_GEOMETRY,
+    ) -> Any:
+        if geometry.hidden in self._runtime_checked:
             assert self._ops is not None
             return self._ops
         if not self._injected_ops:
@@ -86,108 +117,116 @@ class MegaMoEFrontRuntime:
 
             self._ops = dsv4_mega
         assert self._ops is not None
-        required = (
-            "Dsv4MoeFrontPlan",
-            "geometry_moe_front",
-            "build_info_moe_front",
-        )
-        missing = [
-            name
-            for name in required
-            if not callable(getattr(self._ops, name, None))
-        ]
-        if missing:
-            raise RuntimeError(
-                "rtp-kernel does not provide DSV4 MoE front ABI v1: "
-                + ", ".join(missing)
+        if not self._ops_abi_checked:
+            required = (
+                "Dsv4MoeFrontPlan",
+                "geometry_moe_front",
+                "build_info_moe_front",
             )
-        required_parameters = {
-            "Dsv4MoeFrontPlan": ("hidden_states", "hc_fn", "logical_m"),
-            "Dsv4MoeFrontPlan.run_learned_out": (
-                "hc_base",
-                "hc_scale",
-                "ffn_norm_weight",
-                "router_weight",
-                "correction_bias",
-                "collapsed",
-                "collapse_ssq",
-                "normalized_mix",
-                "normalized",
-                "x_fp8",
-                "x_sf",
-                "shared_l1_x_sf",
-                "topk_ids",
-                "topk_weights",
-                "post",
-                "comb",
-                "shared_block_m",
-                "router_logits",
-                "norm_eps",
-                "hc_eps",
-                "route_scale",
-                "use_pdl",
-            ),
-            "Dsv4MoeFrontPlan.run_hash_out": (
-                "hc_base",
-                "hc_scale",
-                "ffn_norm_weight",
-                "router_weight",
-                "input_ids",
-                "tid2eid",
-                "collapsed",
-                "collapse_ssq",
-                "normalized_mix",
-                "normalized",
-                "x_fp8",
-                "x_sf",
-                "shared_l1_x_sf",
-                "router_logits",
-                "topk_ids",
-                "topk_weights",
-                "post",
-                "comb",
-                "shared_block_m",
-                "norm_eps",
-                "hc_eps",
-                "route_scale",
-                "use_pdl",
-            ),
-        }
-        incompatible = []
-        for function_name, parameters in required_parameters.items():
-            target: Any = self._ops
-            for component in function_name.split("."):
-                target = getattr(target, component)
-            try:
-                signature = inspect.signature(target)
-            except (TypeError, ValueError) as exc:
-                incompatible.append(f"{function_name} is not introspectable: {exc}")
-                continue
-            absent = [name for name in parameters if name not in signature.parameters]
-            if absent:
-                incompatible.append(f"{function_name} missing {','.join(absent)}")
-        if incompatible:
-            raise RuntimeError(
-                "rtp-kernel DSV4 MoE front ABI is incompatible: "
-                + "; ".join(incompatible)
-            )
-        geometry = self._ops.geometry_moe_front()
+            missing = [
+                name
+                for name in required
+                if not callable(getattr(self._ops, name, None))
+            ]
+            if missing:
+                raise RuntimeError(
+                    "rtp-kernel does not provide DSV4 MoE front ABI v1: "
+                    + ", ".join(missing)
+                )
+            required_parameters = {
+                "Dsv4MoeFrontPlan": ("hidden_states", "hc_fn", "logical_m"),
+                "Dsv4MoeFrontPlan.run_learned_out": (
+                    "hc_base",
+                    "hc_scale",
+                    "ffn_norm_weight",
+                    "router_weight",
+                    "correction_bias",
+                    "collapsed",
+                    "collapse_ssq",
+                    "normalized_mix",
+                    "normalized",
+                    "x_fp8",
+                    "x_sf",
+                    "shared_l1_x_sf",
+                    "topk_ids",
+                    "topk_weights",
+                    "post",
+                    "comb",
+                    "shared_block_m",
+                    "router_logits",
+                    "norm_eps",
+                    "hc_eps",
+                    "route_scale",
+                    "use_pdl",
+                ),
+                "Dsv4MoeFrontPlan.run_hash_out": (
+                    "hc_base",
+                    "hc_scale",
+                    "ffn_norm_weight",
+                    "router_weight",
+                    "input_ids",
+                    "tid2eid",
+                    "collapsed",
+                    "collapse_ssq",
+                    "normalized_mix",
+                    "normalized",
+                    "x_fp8",
+                    "x_sf",
+                    "shared_l1_x_sf",
+                    "router_logits",
+                    "topk_ids",
+                    "topk_weights",
+                    "post",
+                    "comb",
+                    "shared_block_m",
+                    "norm_eps",
+                    "hc_eps",
+                    "route_scale",
+                    "use_pdl",
+                ),
+            }
+            incompatible = []
+            for function_name, parameters in required_parameters.items():
+                target: Any = self._ops
+                for component in function_name.split("."):
+                    target = getattr(target, component)
+                try:
+                    signature = inspect.signature(target)
+                except (TypeError, ValueError) as exc:
+                    incompatible.append(
+                        f"{function_name} is not introspectable: {exc}"
+                    )
+                    continue
+                absent = [
+                    name for name in parameters if name not in signature.parameters
+                ]
+                if absent:
+                    incompatible.append(
+                        f"{function_name} missing {','.join(absent)}"
+                    )
+            if incompatible:
+                raise RuntimeError(
+                    "rtp-kernel DSV4 MoE front ABI is incompatible: "
+                    + "; ".join(incompatible)
+                )
+            self._ops_abi_checked = True
+        reported_geometry = self._ops.geometry_moe_front(geometry.hidden)
         expected = {
             "abi_version": MOE_FRONT_ABI_VERSION,
             "kernel_contract_version": MOE_FRONT_KERNEL_CONTRACT_VERSION,
-            "hidden": MOE_FRONT_HIDDEN,
-            "hc_mult": MOE_FRONT_HC_MULT,
-            "hc_width": MOE_FRONT_HC_WIDTH,
-            "experts": MOE_FRONT_EXPERTS,
-            "topk": MOE_FRONT_TOPK,
-            "max_m": MOE_FRONT_MAX_M,
-            "scale_cols": MOE_FRONT_SCALE_COLS,
+            "hidden": geometry.hidden,
+            "hc_mult": geometry.hc_mult,
+            "hc_width": geometry.hc_width,
+            "experts": geometry.experts,
+            "topk": geometry.topk,
+            "max_m": geometry.max_m,
+            "scale_cols": geometry.scale_cols,
             "collapse_ssq_bits": 32,
         }
         mismatched = {
-            key: geometry.get(key)
+            key: reported_geometry.get(key)
             for key, value in expected.items()
-            if geometry.get(key) != value
+            if reported_geometry.get(key) != value
         }
         if mismatched:
             raise RuntimeError(
@@ -229,29 +268,38 @@ class MegaMoEFrontRuntime:
                 f"got {mismatched_build}, expected {expected_build} "
                 "with a non-unknown source commit and SHA256"
             )
-        self._runtime_checked = True
+        self._runtime_checked.add(geometry.hidden)
         return self._ops
 
-    def validate_buffer(self, buffer: Any) -> None:
+    def validate_buffer(
+        self,
+        buffer: Any,
+        geometry: MoeFrontGeometry = PRO_MOE_FRONT_GEOMETRY,
+    ) -> None:
         """Validate the zero-copy DeepGEMM publication ABI once per buffer."""
         key = id(buffer)
-        if self._validated_buffers.get(key) is buffer:
+        validated = self._validated_buffers.get(key)
+        if (
+            validated is not None
+            and validated[0] is buffer
+            and validated[1] == geometry.hidden
+        ):
             return
 
         expected = (
             (
                 "x",
                 torch.float8_e4m3fn,
-                MOE_FRONT_HIDDEN,
-                (MOE_FRONT_HIDDEN, 1),
+                geometry.hidden,
+                (geometry.hidden, 1),
             ),
-            ("x_sf", torch.int32, MOE_FRONT_SCALE_COLS, (MOE_FRONT_SCALE_COLS, 1)),
-            ("topk_idx", torch.int64, MOE_FRONT_TOPK, (MOE_FRONT_TOPK, 1)),
+            ("x_sf", torch.int32, geometry.scale_cols, (geometry.scale_cols, 1)),
+            ("topk_idx", torch.int64, geometry.topk, (geometry.topk, 1)),
             (
                 "topk_weights",
                 torch.float32,
-                MOE_FRONT_TOPK,
-                (MOE_FRONT_TOPK, 1),
+                geometry.topk,
+                (geometry.topk, 1),
             ),
         )
         for name, dtype, columns, trailing_stride in expected:
@@ -261,14 +309,14 @@ class MegaMoEFrontRuntime:
             valid = (
                 tensor.dtype == dtype
                 and tensor.dim() == 2
-                and int(tensor.shape[0]) >= MOE_FRONT_MAX_M
+                and int(tensor.shape[0]) >= geometry.max_m
                 and int(tensor.shape[1]) == columns
                 and tuple(tensor.stride()) == trailing_stride
             )
             if not valid:
                 raise TypeError(
                     f"MegaMoE-SE buffer {name} must be {dtype} row-major "
-                    f"[>={MOE_FRONT_MAX_M},{columns}], got dtype={tensor.dtype}, "
+                    f"[>={geometry.max_m},{columns}], got dtype={tensor.dtype}, "
                     f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}"
                 )
 
@@ -278,25 +326,27 @@ class MegaMoEFrontRuntime:
         valid_shared = (
             shared.dtype == torch.int32
             and shared.dim() == 2
-            and int(shared.shape[0]) >= MOE_FRONT_MAX_M
-            and int(shared.shape[1]) == MOE_FRONT_SCALE_COLS
+            and int(shared.shape[0]) >= geometry.max_m
+            and int(shared.shape[1]) == geometry.scale_cols
             and int(shared.stride(0)) == 1
             and int(shared.stride(1)) == int(shared.shape[0])
         )
         if not valid_shared:
             raise TypeError(
                 "MegaMoE-SE buffer shared_l1_acts_sf must be INT32 column-major "
-                f"[>={MOE_FRONT_MAX_M},{MOE_FRONT_SCALE_COLS}], got "
+                f"[>={geometry.max_m},{geometry.scale_cols}], got "
                 f"dtype={shared.dtype}, shape={tuple(shared.shape)}, "
                 f"stride={tuple(shared.stride())}"
             )
         # Retain the owner so a later Python object cannot reuse this id and
         # accidentally inherit validation for a different symmetric buffer.
-        self._validated_buffers[key] = buffer
+        self._validated_buffers[key] = (buffer, geometry.hidden)
 
-    def workspace(self, device: torch.device, buffer: Any) -> MegaMoEFrontWorkspace:
+    def workspace(
+        self, device: torch.device, buffer: Any, geometry: MoeFrontGeometry
+    ) -> MegaMoEFrontWorkspace:
         device_index = -1 if device.index is None else int(device.index)
-        key = (device.type, device_index, id(buffer))
+        key = (device.type, device_index, id(buffer), geometry.hidden)
         workspace = self._workspaces.get(key)
         if workspace is not None and self._workspace_owners.get(key) is buffer:
             return workspace
@@ -307,35 +357,35 @@ class MegaMoEFrontRuntime:
             )
         workspace = MegaMoEFrontWorkspace(
             collapsed=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_HIDDEN),
+                (geometry.max_m, geometry.hidden),
                 dtype=torch.bfloat16,
                 device=device,
             ),
             collapse_ssq=torch.empty(
-                (MOE_FRONT_MAX_M,), dtype=torch.float32, device=device
+                (geometry.max_m,), dtype=torch.float32, device=device
             ),
             normalized_mix=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_HC_WIDTH),
+                (geometry.max_m, geometry.hc_width),
                 dtype=torch.float32,
                 device=device,
             ),
             normalized=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_HIDDEN),
+                (geometry.max_m, geometry.hidden),
                 dtype=torch.bfloat16,
                 device=device,
             ),
             router_logits=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_EXPERTS),
+                (geometry.max_m, geometry.experts),
                 dtype=torch.float32,
                 device=device,
             ),
             post=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_HC_MULT),
+                (geometry.max_m, geometry.hc_mult),
                 dtype=torch.float32,
                 device=device,
             ),
             comb=torch.empty(
-                (MOE_FRONT_MAX_M, MOE_FRONT_HC_MULT, MOE_FRONT_HC_MULT),
+                (geometry.max_m, geometry.hc_mult, geometry.hc_mult),
                 dtype=torch.float32,
                 device=device,
             ),
@@ -373,7 +423,7 @@ class MegaMoEFrontRuntime:
 
 
 class MegaMoEFrontAdapter:
-    """Replace the complete Pro decode FFN front and preserve mHC post."""
+    """Replace the complete supported decode FFN front and preserve mHC post."""
 
     def __init__(self, block, layer_weights: Dict, runtime: MegaMoEFrontRuntime):
         from rtp_llm.utils.model_weight import W
@@ -385,11 +435,20 @@ class MegaMoEFrontAdapter:
                 f"selected strategy={strategy!r}"
             )
         gate = block.ffn.gate
+        hidden = int(block.ffn.dim)
+        try:
+            self.geometry = MOE_FRONT_GEOMETRIES[hidden]
+        except KeyError as exc:
+            raise ValueError(
+                "DSV4 native MoE front supports hidden=7168 (Pro) or "
+                f"hidden=4096 (Flash), got hidden={hidden}"
+            ) from exc
+        geometry = self.geometry
         expected = (
-            ("hidden", int(block.ffn.dim), MOE_FRONT_HIDDEN),
-            ("experts", int(block.ffn.n_routed_experts), MOE_FRONT_EXPERTS),
-            ("topk", int(block.ffn.n_activated_experts), MOE_FRONT_TOPK),
-            ("hc_mult", int(block.ffn_hc.hc_mult), MOE_FRONT_HC_MULT),
+            ("hidden", hidden, geometry.hidden),
+            ("experts", int(block.ffn.n_routed_experts), geometry.experts),
+            ("topk", int(block.ffn.n_activated_experts), geometry.topk),
+            ("hc_mult", int(block.ffn_hc.hc_mult), geometry.hc_mult),
         )
         problems = [
             f"{name}={actual} (expected {wanted})"
@@ -424,25 +483,26 @@ class MegaMoEFrontAdapter:
         self._validate_weights()
 
     def _validate_weights(self) -> None:
+        geometry = self.geometry
         tensors = (
             (
                 "hc_fn",
                 self.hc_fn,
-                (MOE_FRONT_HC_WIDTH, MOE_FRONT_HC_MULT * MOE_FRONT_HIDDEN),
+                (geometry.hc_width, geometry.hc_mult * geometry.hidden),
                 torch.float32,
             ),
-            ("hc_base", self.hc_base, (MOE_FRONT_HC_WIDTH,), torch.float32),
+            ("hc_base", self.hc_base, (geometry.hc_width,), torch.float32),
             ("hc_scale", self.hc_scale, (3,), torch.float32),
             (
                 "ffn_norm_weight",
                 self.ffn_norm_weight,
-                (MOE_FRONT_HIDDEN,),
+                (geometry.hidden,),
                 torch.bfloat16,
             ),
             (
                 "router_weight",
                 self.router_weight,
-                (MOE_FRONT_EXPERTS, MOE_FRONT_HIDDEN),
+                (geometry.experts, geometry.hidden),
                 torch.bfloat16,
             ),
         )
@@ -462,7 +522,7 @@ class MegaMoEFrontAdapter:
                 raise ValueError("HashMoE native front requires tid2eid and no bias")
             if (
                 self.tid2eid.dtype != torch.int32
-                or self.tid2eid.shape[1] != MOE_FRONT_TOPK
+                or self.tid2eid.shape[1] != geometry.topk
             ):
                 raise TypeError("HashMoE tid2eid must be contiguous INT32 [vocab,6]")
         else:
@@ -470,30 +530,31 @@ class MegaMoEFrontAdapter:
                 raise ValueError("learned native front requires correction bias only")
             if (
                 self.correction_bias.dtype != torch.float32
-                or tuple(self.correction_bias.shape) != (MOE_FRONT_EXPERTS,)
+                or tuple(self.correction_bias.shape) != (geometry.experts,)
                 or not self.correction_bias.is_contiguous()
             ):
-                raise TypeError("learned Router bias must be contiguous FP32 [384]")
+                raise TypeError(
+                    "learned Router bias must be contiguous FP32 "
+                    f"[{geometry.experts}]"
+                )
 
-    @staticmethod
-    def _has_row_capacity(tensor: torch.Tensor, row_elements: int) -> bool:
+    def _has_row_capacity(self, tensor: torch.Tensor, row_elements: int) -> bool:
         if not tensor.is_contiguous():
             return False
         available_bytes = tensor.untyped_storage().nbytes() - (
             int(tensor.storage_offset()) * tensor.element_size()
         )
-        required_bytes = MOE_FRONT_MAX_M * row_elements * tensor.element_size()
+        required_bytes = self.geometry.max_m * row_elements * tensor.element_size()
         return available_bytes >= required_bytes
 
-    @staticmethod
-    def _capacity_view(tensor: torch.Tensor, *row_shape: int) -> torch.Tensor:
+    def _capacity_view(self, tensor: torch.Tensor, *row_shape: int) -> torch.Tensor:
         row_elements = 1
         for extent in row_shape:
             row_elements *= extent
-        if not MegaMoEFrontAdapter._has_row_capacity(tensor, row_elements):
+        if not self._has_row_capacity(tensor, row_elements):
             raise ValueError(
                 "DSV4 native MoE front requires graph-stable storage capacity "
-                f"for {MOE_FRONT_MAX_M} rows of shape {row_shape}"
+                f"for {self.geometry.max_m} rows of shape {row_shape}"
             )
         trailing_strides = []
         stride = 1
@@ -501,23 +562,24 @@ class MegaMoEFrontAdapter:
             trailing_strides.append(stride)
             stride *= extent
         return tensor.as_strided(
-            (MOE_FRONT_MAX_M, *row_shape),
+            (self.geometry.max_m, *row_shape),
             (row_elements, *reversed(trailing_strides)),
         )
 
     def supports_decode_shape(
         self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> bool:
+        geometry = self.geometry
         shape_supported = (
             hidden.dim() == 4
             and int(hidden.shape[1]) == 1
-            and tuple(hidden.shape[2:]) == (MOE_FRONT_HC_MULT, MOE_FRONT_HIDDEN)
-            and 1 <= int(hidden.shape[0]) <= MOE_FRONT_MAX_M
+            and tuple(hidden.shape[2:]) == (geometry.hc_mult, geometry.hidden)
+            and 1 <= int(hidden.shape[0]) <= geometry.max_m
             and hidden.dtype == torch.bfloat16
             and hidden.is_contiguous()
         )
         if not shape_supported or not self._has_row_capacity(
-            hidden, MOE_FRONT_HC_MULT * MOE_FRONT_HIDDEN
+            hidden, geometry.hc_mult * geometry.hidden
         ):
             return False
         if not self.is_hash:
@@ -532,10 +594,12 @@ class MegaMoEFrontAdapter:
     def forward_ffn_sublayer(
         self, block, hidden: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
+        geometry = self.geometry
         if not self.supports_decode_shape(hidden, input_ids):
             raise ValueError(
-                "DSV4 native MoE front requires [M,1,4,7168] with stable "
-                "128-row storage capacity (and int64 input IDs with the same "
+                f"DSV4 native MoE front requires [M,1,{geometry.hc_mult},"
+                f"{geometry.hidden}] with stable {geometry.max_m}-row storage "
+                "capacity (and int64 input IDs with the same "
                 f"capacity for HashMoE); got hidden={tuple(hidden.shape)}"
             )
         if hidden.dtype != torch.bfloat16 or not hidden.is_contiguous():
@@ -543,23 +607,23 @@ class MegaMoEFrontAdapter:
         if not hidden.is_cuda and not self.runtime.allows_cpu_for_test:
             raise TypeError("DSV4 native MoE front hidden must be CUDA")
         m = int(hidden.shape[0])
-        flat_hidden = hidden.view(m, MOE_FRONT_HC_MULT, MOE_FRONT_HIDDEN)
+        flat_hidden = hidden.view(m, geometry.hc_mult, geometry.hidden)
         hidden_capacity = self._capacity_view(
-            flat_hidden, MOE_FRONT_HC_MULT, MOE_FRONT_HIDDEN
+            flat_hidden, geometry.hc_mult, geometry.hidden
         )
-        ops = self.runtime.require_ops(hidden.device)
+        ops = self.runtime.require_ops(hidden.device, geometry)
         buffer = block.ffn.native_front_buffer()
-        self.runtime.validate_buffer(buffer)
-        workspace = self.runtime.workspace(hidden.device, buffer)
+        self.runtime.validate_buffer(buffer, geometry)
+        workspace = self.runtime.workspace(hidden.device, buffer, geometry)
         plan = self.runtime.plan(
             ops, self.layer_id, hidden_capacity, self.hc_fn, m
         )
         shared_block_m = block.ffn.native_front_block_m(m)
-        x_fp8_capacity = self._capacity_view(buffer.x, MOE_FRONT_HIDDEN)
-        x_sf_capacity = self._capacity_view(buffer.x_sf, MOE_FRONT_SCALE_COLS)
-        topk_ids_capacity = self._capacity_view(buffer.topk_idx, MOE_FRONT_TOPK)
+        x_fp8_capacity = self._capacity_view(buffer.x, geometry.hidden)
+        x_sf_capacity = self._capacity_view(buffer.x_sf, geometry.scale_cols)
+        topk_ids_capacity = self._capacity_view(buffer.topk_idx, geometry.topk)
         topk_weights_capacity = self._capacity_view(
-            buffer.topk_weights, MOE_FRONT_TOPK
+            buffer.topk_weights, geometry.topk
         )
         common = dict(
             hc_base=self.hc_base,
@@ -600,13 +664,20 @@ class MegaMoEFrontAdapter:
                     **common,
                 )
         ffn_out = block.ffn.forward_prepacked(m, hidden.device)
-        post = workspace.post[:m].view(m, 1, MOE_FRONT_HC_MULT, 1)
+        post = workspace.post[:m].view(m, 1, geometry.hc_mult, 1)
         comb = workspace.comb[:m].view(
-            m, 1, MOE_FRONT_HC_MULT, MOE_FRONT_HC_MULT
+            m, 1, geometry.hc_mult, geometry.hc_mult
         )
         return block.ffn_hc.post(
-            ffn_out.view(m, 1, MOE_FRONT_HIDDEN), hidden, post, comb
+            ffn_out.view(m, 1, geometry.hidden), hidden, post, comb
         )
 
 
-__all__ = ["MegaMoEFrontAdapter", "MegaMoEFrontRuntime"]
+__all__ = [
+    "FLASH_MOE_FRONT_GEOMETRY",
+    "MOE_FRONT_GEOMETRIES",
+    "MegaMoEFrontAdapter",
+    "MegaMoEFrontRuntime",
+    "MoeFrontGeometry",
+    "PRO_MOE_FRONT_GEOMETRY",
+]

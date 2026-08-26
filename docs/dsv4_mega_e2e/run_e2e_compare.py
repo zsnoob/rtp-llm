@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""DSV4 single-card e2e: normal vs mega (CSA+HCA) greedy compare.
+"""DSV4 e2e: normal vs Mega, or controlled four-kernel-front comparison.
 
-Starts the RTP server twice — once with the mega switches off, once with
-DSV4_MEGA_CSA=1 DSV4_MEGA_HCA=1 — replays the same greedy queries against
-both, and diffs the outputs token-by-token.
+Starts the RTP server twice and replays the same greedy queries. By default the
+first leg has Mega switches off and the second enables CSA/HCA. With
+``E2E_MOE_FRONT=1``, both legs instead enable CSA/HCA and MegaMoE-SE, and the
+only changed execution switch is ``DSV4_MEGA_MOE_FRONT``.
 
 Environment:
     E2E_CKPT    (required) checkpoint dir, e.g. a DeepSeek-V4-Flash checkout
@@ -13,7 +14,7 @@ Environment:
     E2E_DP_SIZE data-parallel size (default 1; EP4 recipe uses 4)
     E2E_WORLD_SIZE distributed world size (default E2E_EP_SIZE)
     E2E_LOCAL_WORLD_SIZE local ranks on this host (default E2E_WORLD_SIZE)
-    E2E_MOE_FRONT set to 1 to enable the native four-kernel Pro MoE front
+    E2E_MOE_FRONT set to 1 to enable the native four-kernel Pro/Flash MoE front
     E2E_PYTHON  python of a serving-capable venv (default: this interpreter)
     E2E_OUT     output dir for logs/results (default ./e2e_out)
     E2E_JIT_CACHE  base dir for the managed JIT caches (default ~/.cache/rtp_jit)
@@ -274,9 +275,18 @@ def main() -> None:
     only = sys.argv[1] if len(sys.argv) > 1 else None
     runs = {}
     if only in (None, "baseline"):
+        controlled_front_env = {
+            "DSV4_MEGA_CSA": "1",
+            "DSV4_MEGA_HCA": "1",
+            "DSV4_MEGA_MOE_FRONT": "0",
+            "DSV4_USE_MEGA_MOE_SE": "1",
+            "DSV4_USE_MEGA_MOE": "1",
+            "DSV4_USE_MEGA_MOE_FUSED": "0",
+            "DSV4_MOE_STRATEGY": "",
+        }
         runs["baseline"] = run(
             "baseline",
-            {
+            controlled_front_env if MOE_FRONT else {
                 "DSV4_MEGA_CSA": "0",
                 "DSV4_MEGA_HCA": "0",
                 "DSV4_MEGA_MOE_FRONT": "0",
