@@ -77,8 +77,8 @@ clean operator wheel SHA256 为
 `b5a84c0c6ff2c68a3a61e106e3d8d5fa396a5b16975f22e0a79f03d950bd5d16`。四卡 WebIDE
 已完成该 wheel 的 SM103 构建、安装、逐 M 正确性/性能、Flash EP4 token 生成和受控 TPS
 A/B；完整 checkpoint 为 `/tmp/DeepSeek-V4-Flash-0731`。当前 release gate 剩余
-DSV4-Pro 真实权重 EP4 回归、HashMoE 整模型回归、CUDA Graph serving A/B 和正式 wheel
-发布/lock 更新；Flash learned-routing eager serving 已通过。
+DSV4-Pro 真实权重 EP4 回归、HashMoE 整模型回归和正式 wheel 发布/lock 更新；Flash
+learned-routing eager 与 batch-1 CUDA Graph serving 均已通过。
 
 ## 2. 支持边界
 
@@ -962,10 +962,10 @@ dequant/requant。Flash checkpoint 的 FFN mHC scale `[3,1]` 在进入 native AB
 证明生产调用链可运行，不作为整模型 bitwise 正确性证明；数值正确性以上述逐 M operator
 对照为准。
 
-受控 TPS A/B 中，两轮均固定 `CSA=1, HCA=1, MegaMoE=1, MegaMoE-SE=1`、关闭 CUDA
-Graph、concurrency 1，唯一变量是 `DSV4_MEGA_MOE_FRONT=0/1`。每轮服务 ready 后用同一
-greedy prompt 生成 64 tokens warmup，再连续三次生成 256 tokens；加载、JIT 和清理不计入
-样本。结果中位数为：
+第一轮受控 TPS A/B 固定 `CSA=1, HCA=1, MegaMoE=1, MegaMoE-SE=1`、关闭 CUDA Graph、
+concurrency 1，唯一变量是 `DSV4_MEGA_MOE_FRONT=0/1`。每轮服务 ready 后用同一 greedy
+prompt 生成 64 tokens warmup，再连续三次生成 256 tokens；加载、JIT 和清理不计入样本。
+该 eager 结果只用于确认端到端收益方向，不作为生产 Graph 基线：
 
 | 路径 | server time / 256 tok | TTFT | E2E TPS | decode TPS |
 | --- | ---: | ---: | ---: | ---: |
@@ -985,6 +985,43 @@ greedy prompt 生成 64 tokens warmup，再连续三次生成 256 tokens；加�
 `2d831bfdec3892c188d867051deab4e4c0e76c457a39078062fec6396cdead57` 和
 `7b72ebb9f689d5831f75154910771c26775c5f06e336b47a388385d4cf367ba8`。
 
-这组数据证明 Flash learned-routing 的四-kernel front 已在完整 CSA+HCA+MegaMoE-SE EP4
-serving 中产生端到端收益，但样本仅为单 prompt、三次、eager decode。Pro/HashMoE、CUDA
-Graph serving、代表性 batch/context grid 和开关关闭回归仍是发布前剩余验证。
+生产口径复测打开 `--enable_cuda_graph=1`，并用 `--decode_capture_config=1` 只捕获本轮
+concurrency-1 对应的 batch-1 decode graph。baseline/candidate 都先完成 3 次 64-token
+warmup，再执行 5 次相同 256-token 请求；模型、prompt、采样参数、CSA/HCA、MegaMoE-SE、
+EP4 拓扑与 wheel 完全相同。两轮服务日志都记录 `enable_cuda_graph: 1` 和一个 decode capture
+batch；`CudaGraphRunner::createForDecode()` 同步执行 `initCapture()->captureDecode()`，任一
+capture 或 replay-and-sync check 异常都会阻止 server ready。本轮两轮均 ready、完成请求并
+以 `rc=0` 退出，因此下面是实际 Graph replay 的服务结果：
+
+| 路径 | server time / 256 tok | TTFT | E2E TPS | decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| baseline：native front 关闭 | 5,024.418 ms | 108.353 ms | 50.95117 | 52.04891 |
+| candidate：native front 开启 | 4,963.724 ms | 133.174 ms | 51.57418 | 52.79021 |
+| candidate / baseline | 0.98792x latency | +24.821 ms | **1.01223x** | **1.01424x** |
+
+五次 E2E TPS 原始值为 baseline
+`[49.446374, 50.779404, 50.951175, 51.227427, 51.122386]`，candidate
+`[47.504625, 51.574181, 51.649110, 51.981827, 51.042921]`。两腿每个正式请求均为
+`input_len=26`、`output_len=256`，所有 local/memory/remote、prefill/decode reuse 字段都为
+零，因此不存在 prefix/KV reuse 偏差。两腿第一个正式样本仍分别出现 `283.280 ms` 和
+`528.880 ms` TTFT，随后回落；`first_token_cost_time` 是从请求开始到第一个新 token 写入的
+服务级时间，包含 prefill、采样和首输出，不是四-kernel decode front 的 kernel latency。
+native front 只在 `q_len=1` decode 分支启用，prefill 保持原路径，所以本轮 TTFT
+`+24.821 ms` 记录为独立 server A/B 的首 token 波动，不归因于四-kernel 实现；与该优化
+直接对应的是长 decode 段的 `1.01424x` TPS。
+
+Graph 原始结果位于：
+
+```text
+/tmp/dsv4-flash-moefront-graph-tps-45a7cb7-20260827/results/
+/tmp/dsv4-flash-moefront-graph-tps-45a7cb7-20260827/runner.log
+/tmp/dsv4-flash-moefront-graph-tps-45a7cb7-20260827/runner.rc
+```
+
+Graph baseline/candidate perf JSON 的 SHA256 分别为
+`adee62a7e25a7afe78efa72f69bd318e6bc46a2019ebd0dc1e92b7e20ac2d7b4` 和
+`961d2e08ad1de113124091e246caec9464ef5bddee3e7ee7540fec04127f9e00`。
+
+这组数据证明 Flash learned-routing 的四-kernel front 已在完整
+CSA+HCA+MegaMoE-SE EP4、batch-1 CUDA Graph serving 中产生稳定 decode 收益。Pro/HashMoE、
+代表性 batch/context grid 和开关关闭回归仍是发布前剩余验证。

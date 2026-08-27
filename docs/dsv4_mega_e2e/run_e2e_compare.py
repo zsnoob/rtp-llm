@@ -20,8 +20,12 @@ Environment:
     E2E_KERNEL_ROOT optional clean-wheel install root for extension overrides
     E2E_OUT     output dir for logs/results (default ./e2e_out)
     E2E_JIT_CACHE  base dir for the managed JIT caches (default ~/.cache/rtp_jit)
+    E2E_CUDA_GRAPH set to 1 to capture and replay the decode path
+    E2E_DECODE_CAPTURE_CONFIG graph batch buckets (default: 1 for this runner)
     E2E_PERF    set to 1 for a controlled 64-token warmup + 3x256-token run
     E2E_PERF_ONLY  skip functional queries and run only the controlled TPS case
+    E2E_PERF_WARMUPS number of identical warmup requests (default 1)
+    E2E_PERF_SAMPLES number of measured requests (default 3)
 """
 
 import json
@@ -77,6 +81,17 @@ PERF_ONLY = os.environ.get("E2E_PERF_ONLY", "0") not in (
 )
 if PERF_ONLY:
     PERF = True
+CUDA_GRAPH = os.environ.get("E2E_CUDA_GRAPH", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+DECODE_CAPTURE_CONFIG = os.environ.get(
+    "E2E_DECODE_CAPTURE_CONFIG", "1" if CUDA_GRAPH else ""
+)
+if CUDA_GRAPH and not DECODE_CAPTURE_CONFIG:
+    sys.exit("E2E_CUDA_GRAPH=1 requires E2E_DECODE_CAPTURE_CONFIG")
 if MOE_FRONT and EP_SIZE <= 1:
     sys.exit("E2E_MOE_FRONT=1 requires E2E_EP_SIZE > 1")
 OUT_DIR = Path(os.environ.get("E2E_OUT", "e2e_out"))
@@ -88,7 +103,7 @@ SERVER_ARGS = [
     "--max_seq_len",
     "4096",
     "--enable_cuda_graph",
-    "0",
+    "1" if CUDA_GRAPH else "0",
     "--act_type",
     "BF16",
     "--tp_size",
@@ -114,6 +129,8 @@ SERVER_ARGS = [
     "--fp8_kv_cache",
     "1",
 ]
+if DECODE_CAPTURE_CONFIG:
+    SERVER_ARGS.extend(["--decode_capture_config", DECODE_CAPTURE_CONFIG])
 QUERIES = [
     {"prompt": "What is the capital of France?", "max_new_tokens": 64},
     {"prompt": "2+2=", "max_new_tokens": 64},
@@ -132,7 +149,10 @@ PERF_PROMPT = (
 )
 PERF_WARMUP_TOKENS = 64
 PERF_SAMPLE_TOKENS = 256
-PERF_SAMPLES = 3
+PERF_WARMUPS = int(os.environ.get("E2E_PERF_WARMUPS", "1"))
+PERF_SAMPLES = int(os.environ.get("E2E_PERF_SAMPLES", "3"))
+if PERF_WARMUPS < 1 or PERF_SAMPLES < 1:
+    sys.exit("E2E_PERF_WARMUPS and E2E_PERF_SAMPLES must be positive")
 
 
 def assert_port_unused() -> None:
@@ -287,20 +307,29 @@ def performance_sample(payload: dict) -> dict:
 
 
 def query_performance(tag: str) -> dict:
-    query(PERF_PROMPT, PERF_WARMUP_TOKENS)
+    warmups = [
+        query(PERF_PROMPT, PERF_WARMUP_TOKENS)
+        for _ in range(PERF_WARMUPS)
+    ]
     print(
-        f"[{tag}] performance warmup complete: {PERF_WARMUP_TOKENS} tokens",
+        f"[{tag}] performance warmup complete: {PERF_WARMUPS}x"
+        f"{PERF_WARMUP_TOKENS} tokens",
         flush=True,
     )
     samples = []
+    raw_samples = []
     for index in range(PERF_SAMPLES):
         payload = query(PERF_PROMPT, PERF_SAMPLE_TOKENS)
+        raw_samples.append(payload)
         sample = performance_sample(payload)
         samples.append(sample)
         print(f"[{tag}] performance sample {index}: {sample}", flush=True)
     summary = {
         "prompt": PERF_PROMPT,
+        "cuda_graph": CUDA_GRAPH,
+        "decode_capture_config": DECODE_CAPTURE_CONFIG,
         "warmup_tokens": PERF_WARMUP_TOKENS,
+        "warmup_count": PERF_WARMUPS,
         "sample_tokens": PERF_SAMPLE_TOKENS,
         "sample_count": PERF_SAMPLES,
         "samples": samples,
@@ -315,6 +344,13 @@ def query_performance(tag: str) -> dict:
     }
     (OUT_DIR / f"{tag}.perf.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2)
+    )
+    (OUT_DIR / f"{tag}.perf.raw.json").write_text(
+        json.dumps(
+            {"warmups": warmups, "samples": raw_samples},
+            ensure_ascii=False,
+            indent=2,
+        )
     )
     print(f"[{tag}] performance median: {summary}", flush=True)
     return summary
