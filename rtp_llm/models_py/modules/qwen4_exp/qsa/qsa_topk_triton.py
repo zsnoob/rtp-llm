@@ -151,7 +151,7 @@ def try_select_qsa_tokens(
         and scores.dtype == torch.float32
         and scores.ndim == 2
         and 0 < scores.shape[0] <= 32768
-        and 0 < scores.shape[1] <= 8192
+        and 0 < scores.shape[1] <= 8704
         and scores.stride(0) > 0
         and scores.stride(1) > 0
         and lengths.shape == (scores.shape[0],)
@@ -164,6 +164,12 @@ def try_select_qsa_tokens(
     ):
         return None
     rows, columns = scores.shape
+    # SM90 radix kernels cover the extra graph-capacity tile used by 32K
+    # contexts plus generated tokens. Other paths retain their prior bounds.
+    if columns > 8192 and (
+        packed_count or torch.cuda.get_device_capability(scores.device) != (9, 0)
+    ):
+        return None
     if scores_are_masked and not packed_count:
         from rtp_llm.models_py.modules.qwen4_exp.qsa.cub_topk import try_cub_qsa_tokens
 
@@ -204,7 +210,7 @@ def try_select_qsa_tokens(
         return output
     if (
         not packed_count
-        and 1024 <= columns <= 8192
+        and 1024 <= columns <= 8704
         and rows <= 32
         and scores.is_contiguous()
         and lengths.is_contiguous()
@@ -228,7 +234,7 @@ def try_select_qsa_tokens(
             return output
     if (
         not packed_count
-        and 1024 <= columns <= 8192
+        and 1024 <= columns <= 8704
         and 32 < rows <= 65536
         and scores.is_contiguous()
         and lengths.is_contiguous()

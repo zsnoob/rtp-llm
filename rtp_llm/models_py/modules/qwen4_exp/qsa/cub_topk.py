@@ -36,14 +36,14 @@ namespace rtp_llm {
 // 512th key, then the selected 512 are stable-sorted (equal keys keep the
 // compacted column order, matching the native tie order) and emitted with
 // the same token-expansion contract as qsaCubStableTopK.
-template<int Threads = 512>
+template<int Threads = 512, int MaxItems = 16>
 __global__ void qsaRadixTopK(const float*   scores,
                              const int32_t* lengths,
                              int32_t*       output,
                              int            columns,
                              bool           finite_only) {
     constexpr int K         = 512;
-    constexpr int MAX_ITEMS = 16;
+    constexpr int MAX_ITEMS = MaxItems;
     using SelectedSort      = cub::BlockRadixSort<uint32_t, Threads, 1, uint32_t>;
     using BlockScan          = cub::BlockScan<uint32_t, Threads>;
     __shared__ union SharedOps {
@@ -178,7 +178,12 @@ __global__ void qsaRadixTopK(const float*   scores,
     // Stable descending sort by key; the compaction order (column ascending)
     // is preserved for ties, matching the frozen native TopK order.
     uint32_t s_key[1], s_col[1];
-    s_key[0] = sel_key[threadIdx.x];
+    // Native TopK stably value-sorts the gathered elements. Signed zeros
+    // compare equal when both belong to the above-threshold group. At a
+    // -0 threshold, +0 elements were gathered before -0 boundary ties.
+    const uint32_t selected_key = sel_key[threadIdx.x];
+    s_key[0] = selected_key == 0x7fffffffu && thr < 0x7fffffffu
+                   ? 0x80000000u : selected_key;
     s_col[0] = sel_col[threadIdx.x];
     SelectedSort(ops.sort).SortDescending(s_key, s_col);
     __syncthreads();
@@ -247,14 +252,14 @@ struct QsaGreater {
 // unchanged. Rows are unrestricted (prefill batch x max_rows); inputs with NaN
 // or boundary bins wider than the candidate buffers fall back to the frozen
 // four-pass select, which handles every distribution.
-template<int Threads = 512>
+template<int Threads = 512, int MaxItems = 16>
 __global__ void qsaRadixTopKP(const float*   scores,
                               const int32_t* lengths,
                               int32_t*       output,
                               int            columns,
                               bool           finite_only) {
     constexpr int K         = 512;
-    constexpr int MAX_ITEMS = 16;
+    constexpr int MAX_ITEMS = MaxItems;
     constexpr int CAND      = 2048;
     using SelectedSort      = cub::BlockRadixSort<uint32_t, Threads, 1, uint32_t>;
     using BlockScan         = cub::BlockScan<uint32_t, Threads>;
@@ -913,18 +918,23 @@ void qsa_radix_topk(torch::Tensor scores, torch::Tensor lengths, torch::Tensor o
     TORCH_CHECK(scores.device() == lengths.device() && scores.device() == output.device());
     const int rows = scores.size(0), columns = scores.size(1);
     TORCH_CHECK(rows >= 1 && rows <= 32, "radix topk expects decode row counts");
-    TORCH_CHECK(columns >= 512 && columns <= 8192, "radix topk expects 512..8192 score columns");
+    TORCH_CHECK(columns >= 512 && columns <= 8704, "radix topk expects 512..8704 score columns");
     TORCH_CHECK(lengths.numel() == rows && output.size(0) == rows && output.size(1) == 2051);
     if (!rows)
         return;
     c10::cuda::CUDAGuard guard(scores.device());
     auto                 stream = at::cuda::getCurrentCUDAStream().stream();
-    rtp_llm::qsaRadixTopK<512><<<rows, 512, 0, stream>>>(
-        scores.data_ptr<float>(),
-        lengths.data_ptr<int32_t>(),
-        output.data_ptr<int32_t>(),
-        columns,
-        finite_only);
+    // Keep the established specialization for <=8192 columns. Decode graphs
+    // for a 32K prompt plus output headroom require one extra item per thread.
+    if (columns <= 8192) {
+        rtp_llm::qsaRadixTopK<512, 16><<<rows, 512, 0, stream>>>(
+            scores.data_ptr<float>(), lengths.data_ptr<int32_t>(),
+            output.data_ptr<int32_t>(), columns, finite_only);
+    } else {
+        rtp_llm::qsaRadixTopK<512, 17><<<rows, 512, 0, stream>>>(
+            scores.data_ptr<float>(), lengths.data_ptr<int32_t>(),
+            output.data_ptr<int32_t>(), columns, finite_only);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 void qsa_radix_topk_p(torch::Tensor scores, torch::Tensor lengths, torch::Tensor output, bool finite_only) {
@@ -936,18 +946,23 @@ void qsa_radix_topk_p(torch::Tensor scores, torch::Tensor lengths, torch::Tensor
     TORCH_CHECK(scores.device() == lengths.device() && scores.device() == output.device());
     const int rows = scores.size(0), columns = scores.size(1);
     TORCH_CHECK(rows >= 1 && rows <= 65536, "prefill radix topk expects 1..65536 rows");
-    TORCH_CHECK(columns >= 512 && columns <= 8192, "prefill radix topk expects 512..8192 score columns");
+    TORCH_CHECK(columns >= 512 && columns <= 8704, "prefill radix topk expects 512..8704 score columns");
     TORCH_CHECK(lengths.numel() == rows && output.size(0) == rows && output.size(1) == 2051);
     if (!rows)
         return;
     c10::cuda::CUDAGuard guard(scores.device());
     auto                 stream = at::cuda::getCurrentCUDAStream().stream();
-    rtp_llm::qsaRadixTopKP<512><<<rows, 512, 0, stream>>>(
-        scores.data_ptr<float>(),
-        lengths.data_ptr<int32_t>(),
-        output.data_ptr<int32_t>(),
-        columns,
-        finite_only);
+    // Keep the established specialization for <=8192 columns. Decode graphs
+    // for a 32K prompt plus output headroom require one extra item per thread.
+    if (columns <= 8192) {
+        rtp_llm::qsaRadixTopKP<512, 16><<<rows, 512, 0, stream>>>(
+            scores.data_ptr<float>(), lengths.data_ptr<int32_t>(),
+            output.data_ptr<int32_t>(), columns, finite_only);
+    } else {
+        rtp_llm::qsaRadixTopKP<512, 17><<<rows, 512, 0, stream>>>(
+            scores.data_ptr<float>(), lengths.data_ptr<int32_t>(),
+            output.data_ptr<int32_t>(), columns, finite_only);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
@@ -1101,7 +1116,7 @@ def radix_supported(scores, lengths):
         and scores.dtype == torch.float32
         and scores.ndim == 2
         and 1 <= scores.shape[0] <= 32
-        and 1024 <= scores.shape[1] <= 8192
+        and 1024 <= scores.shape[1] <= 8704
         and scores.is_contiguous()
         and lengths.dtype == torch.int32
         and lengths.shape == (scores.shape[0],)
@@ -1141,7 +1156,7 @@ def prefill_radix_supported(scores, lengths):
         and scores.dtype == torch.float32
         and scores.ndim == 2
         and 32 < scores.shape[0] <= 65536
-        and 1024 <= scores.shape[1] <= 8192
+        and 1024 <= scores.shape[1] <= 8704
         and scores.is_contiguous()
         and lengths.dtype == torch.int32
         and lengths.shape == (scores.shape[0],)
